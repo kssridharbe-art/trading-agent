@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delta Exchange - BTCUSD Automated Trading Agent</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <header class="app-header">
+        <div class="logo-area">
+            <div class="status-indicator live"></div>
+            <h1>DELTA QUANT AGENT <span>BTC/USDT 5M PERPETUAL</span></h1>
+        </div>
+        <div class="header-controls">
+            <div class="circuit-status" id="circuitStatusBadge">SYSTEM NORMAL</div>
+            <div class="mode-badge" id="tradingModeBadge">PAPER TRADING</div>
+            <button class="btn btn-danger" id="emergencyCloseBtn">EMERGENCY CLOSE</button>
+        </div>
+    </header>
+
+    <div class="dashboard-grid">
+        <!-- 1. ACCOUNT OVERVIEW CARD -->
+        <div class="card account-card">
+            <div class="card-title">ACCOUNT & MARGIN OVERVIEW</div>
+            <div class="metric-row">
+                <div class="metric">
+                    <span class="label">Total Capital</span>
+                    <span class="value" id="valTotalCapital">10,000.00 USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Total Equity</span>
+                    <span class="value highlight" id="valTotalEquity">10,000.00 USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Unrealized P&L</span>
+                    <span class="value" id="valUnrealizedPnL">0.00 USDT</span>
+                </div>
+            </div>
+            <div class="metric-row sub-row">
+                <div class="metric">
+                    <span class="label">Used Margin (70% Max)</span>
+                    <span class="value" id="valUsedMargin">0.00 USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Available Margin</span>
+                    <span class="value" id="valAvailableMargin">7,000.00 USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Unallocated Cash (30% Buffer)</span>
+                    <span class="value" id="valUnallocatedCash">3,000.00 USDT</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. MARKET & SIGNAL OVERVIEW CARD -->
+        <div class="card market-card">
+            <div class="card-title">MARKET DATA & LIVE SIGNALS</div>
+            <div class="metric-row">
+                <div class="metric">
+                    <span class="label">BTC Price (Live)</span>
+                    <span class="value large" id="valLivePrice">--.-- USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">SuperTrend (10, 3)</span>
+                    <span class="badge" id="badgeSuperTrend">INIT</span>
+                    <span class="sub-val" id="valSuperTrendLine">--</span>
+                </div>
+                <div class="metric">
+                    <span class="label">EMA 9 Filter</span>
+                    <span class="value" id="valEMA">--</span>
+                    <span class="sub-val" id="valEMASlope">Slope: --</span>
+                </div>
+            </div>
+            <div class="signal-alert-box" id="signalAlertBox">
+                <div class="signal-type" id="signalType">LATEST SIGNAL: NONE</div>
+                <div class="signal-reason" id="signalReason">Awaiting first 5-minute candle completion...</div>
+            </div>
+        </div>
+
+        <!-- 3. ACTIVE POSITION CARD -->
+        <div class="card position-card">
+            <div class="card-title">ACTIVE POSITION STATUS</div>
+            <div class="metric-row">
+                <div class="metric">
+                    <span class="label">Side</span>
+                    <span class="badge position-badge" id="badgePositionSide">NONE</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Quantity</span>
+                    <span class="value" id="valPositionQty">0 Contracts (0.000 BTC)</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Entry Price</span>
+                    <span class="value" id="valEntryPrice">--.--</span>
+                </div>
+            </div>
+            <div class="metric-row sub-row">
+                <div class="metric">
+                    <span class="label">Margin In Position</span>
+                    <span class="value" id="valPositionMargin">0.00 USDT</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Est. Liquidation Price</span>
+                    <span class="value danger-val" id="valLiqPrice">--.--</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Current Position P&L</span>
+                    <span class="value" id="valCurrentPnL">0.00 USDT</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. STRATEGY CONFIGURATION PANEL -->
+        <div class="card config-card">
+            <div class="card-title">STRATEGY PARAMETERS & CONTROLS</div>
+            <form id="configForm" class="config-grid">
+                <div class="form-group">
+                    <label for="selectEMAMethod">EMA 9 Confirmation Method:</label>
+                    <select id="selectEMAMethod" class="form-control">
+                        <option value="METHOD_C" selected>Method C: Both Candle Position & Slope (Default)</option>
+                        <option value="METHOD_A">Method A: Candle Close Above/Below EMA</option>
+                        <option value="METHOD_B">Method B: EMA 9 Slope Upward/Downward</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="inputLeverage">Leverage Multiplier:</label>
+                    <input type="number" id="inputLeverage" class="form-control" min="1" max="100" value="10">
+                </div>
+                <div class="form-group">
+                    <label for="inputMarginPct">Margin Allocation % (Default 70%):</label>
+                    <input type="number" id="inputMarginPct" class="form-control" min="10" max="95" value="70">
+                </div>
+                <div class="form-group form-actions">
+                    <button type="submit" class="btn btn-primary">SAVE PARAMETERS</button>
+                    <button type="button" class="btn btn-secondary" id="btnOpenBacktestModal">RUN BACKTEST</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 5. TRADE EXECUTION HISTORY TABLE -->
+    <div class="card table-card">
+        <div class="card-title">COMPLETED TRADING HISTORY (DELTA EXCHANGE REVERSAL STRATEGY)</div>
+        <div class="table-responsive">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Trade ID</th>
+                        <th>Side</th>
+                        <th>Entry Time</th>
+                        <th>Exit Time</th>
+                        <th>Entry Price</th>
+                        <th>Exit Price</th>
+                        <th>Size (BTC)</th>
+                        <th>Margin</th>
+                        <th>Fees Paid</th>
+                        <th>Net P&L</th>
+                        <th>Return %</th>
+                        <th>Exit Reason</th>
+                    </tr>
+                </thead>
+                <tbody id="tradeHistoryBody">
+                    <tr><td colspan="12" class="empty-state">No executed trades yet. Waiting for candle signals...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 6. BACKTEST MODAL -->
+    <div class="modal" id="backtestModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>HISTORICAL BACKTEST ANALYZER</h2>
+                <button class="close-btn" id="btnCloseBacktestModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="backtest-controls">
+                    <label>Historical Days:
+                        <input type="number" id="btDays" value="14" min="1" max="90">
+                    </label>
+                    <label>EMA Method:
+                        <select id="btMethod">
+                            <option value="METHOD_A">Method A (Close)</option>
+                            <option value="METHOD_B">Method B (Slope)</option>
+                            <option value="METHOD_C">Method C (Both)</option>
+                        </select>
+                    </label>
+                    <button class="btn btn-primary" id="btnExecuteBacktest">START SIMULATION</button>
+                </div>
+                <div id="btLoadingSpinner" class="loading-state" style="display:none;">
+                    Downloading candles and running bar-by-bar simulation...
+                </div>
+                <div id="btResultsArea" style="display:none;">
+                    <div class="stats-grid" id="btStatsGrid"></div>
+                    <div class="chart-wrapper">
+                        <canvas id="equityChartCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

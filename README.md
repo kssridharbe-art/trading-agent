@@ -1,207 +1,85 @@
-# Local Agents: CrewAI + Ollama
+# trading-agent
 
-Two chat apps that run entirely on your machine. Ask a question, an agent
-answers in the chat. No API keys, no cost per run, nothing sent to a hosted
-provider.
+# DELTA EXCHANGE – BTCUSD AUTOMATED TRADING AGENT
+## Modular Quantitative Trading System & Execution Engine
 
-- `single_agent/` one agent answers your question
-- `multi_agent/` one agent answers, a second one tightens the answer first
+Automated algorithmic trading application for **BTCUSD / BTCUSDT Perpetual Contracts on Delta Exchange** using **SuperTrend (10, 3)** and **EMA 9 (Method C)** with strict 70% margin allocation, 30% unallocated cash buffer, and dual-layer risk circuit breakers.
 
-Both have their own Streamlit UI and both talk to a local Ollama server running
-`llama3.2:1b` (about 1.3 GB).
+---
 
-## Layout
+### 1. Strategy Overview
+
+- **Asset**: BTCUSDT Linear Perpetual (`contract_value = 0.001 BTC`, `tick_size = 0.5 USDT`)
+- **Timeframe**: 5-Minute Candles (Completed bars only)
+- **Primary Trend & Exit Driver**: SuperTrend (Length: 10, Multiplier: 3.0)
+- **Confirmation Filter**: EMA 9 (Method C: Both Candle Close & Slope Confirmation)
+- **Capital Allocation**: 70% Max Margin Allocation per trade (30% Cash Buffer)
+- **Leverage**: 10x Isolated (Configurable 1x–100x)
+
+#### Rules of Engagement
+- **LONG Entry**: Completed 5m candle confirms SuperTrend reversal from RED to GREEN + Close > EMA 9 + EMA 9 higher than previous candle ($Slope > 0$).
+- **SHORT Entry**: Completed 5m candle confirms SuperTrend reversal from GREEN to RED + Close < EMA 9 + EMA 9 lower than previous candle ($Slope < 0$).
+- **Exit & Reversal**:
+  - Close existing position first on opposite SuperTrend signal.
+  - Verify exchange position is completely flat.
+  - Check EMA 9 confirmation before opening the opposite position. If EMA fails, remain flat in Cash.
+
+---
+
+### 2. Project Architecture
 
 ```
-local_agent/
-  README.md            this file
-  OLLAMA_SETUP.md      install Ollama, pull the model, fix common errors
-  requirements.txt
-  single_agent/
-    app.py             the whole chat app, about 85 lines
-    README.md
-  multi_agent/
-    app.py             the whole chat app, about 125 lines
-    README.md
+trading-agent/
+├── delta_trading_agent/
+│   ├── config/          # Central configuration & parameters (settings.py)
+│   ├── indicators/      # SuperTrend (10,3) & EMA 9 engines (supertrend.py, ema.py)
+│   ├── signals/         # Reversal & EMA confirmation state machine (signal_generator.py)
+│   ├── risk/            # 70% margin, leverage, 5% daily loss & 3-loss breaker (risk_manager.py)
+│   ├── execution/       # Position lifecycle & reversal sequencing (strategy_executor.py)
+│   ├── exchange/        # Delta REST client (HMAC-SHA256) & WebSocket ticker/candle feed
+│   ├── backtest/        # Historical bar-by-bar backtest engine & metrics reporter
+│   ├── paper/           # Simulated live execution engine on real-time data
+│   ├── storage/         # SQLite persistent database (database.py)
+│   ├── dashboard/       # Dark terminal web UI & Flask REST server
+│   └── tests/           # Full unit test suite (14 passing tests)
+├── run_backtest.py      # CLI backtesting runner
+├── run_dashboard.py     # CLI web dashboard runner (port 5000)
+├── run_paper.py         # CLI paper trading runner
+├── run_full_audit.py    # Independent strategy & financial audit suite
+├── validate_ema_methods.py # EMA Methods A/B/C comparative validator
+└── .env.example         # Example API credentials
 ```
 
-Each app is a single file that runs top to bottom, so you can read it in order
-with no jumping between modules.
+---
 
-Each folder is self contained, so you can copy one on its own and it still runs.
+### 3. Quickstart Guide
 
-## Setup
-
-**1. Install Ollama and pull the model.** Full instructions with troubleshooting
-are in [OLLAMA_SETUP.md](OLLAMA_SETUP.md). The short version:
-
+#### 1. Run Unit Tests (14/14 Passing)
 ```bash
-# install Ollama from https://ollama.com/download, then:
-ollama pull llama3.2:1b
-ollama list          # confirm llama3.2:1b is there
+python -m pytest delta_trading_agent/tests
 ```
 
-**2. Install the Python packages.** Use a virtual environment. CrewAI pulls in a
-large dependency tree and upgrades shared packages such as `pillow`, `rich` and
-`opentelemetry`, which can break unrelated projects if installed globally:
-
+#### 2. Run Historical Backtest on Delta Exchange Candles
 ```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS and Linux
-pip install -r requirements.txt
+python run_backtest.py --days 30 --method METHOD_C --leverage 10
 ```
 
-## Running
-
-Run each app from inside its own folder:
-
+#### 3. Launch Live Web Trading Dashboard
 ```bash
-cd single_agent
-streamlit run app.py
+python run_dashboard.py --port 5000
 ```
+Open **`http://localhost:5000`** in your browser to view the real-time Account, Market, and Position cards, trade history, emergency close controls, and interactive backtest simulator.
 
+#### 4. Run Full Strategy Audit Suite
 ```bash
-cd multi_agent
-streamlit run app.py
+python run_full_audit.py
 ```
+Outputs:
+- `signal_reconciliation_audit.csv`: Complete bar-by-bar audit of all 576 reversals.
+- `backtest_trade_log_audit.csv`: Complete financial trade-by-trade audit with fees, slippage, and gross/net P&L.
 
-Streamlit opens http://localhost:8501. To run both at once, give the second one
-a different port:
+---
 
-```bash
-streamlit run app.py --server.port 8502
-```
-
-## How the two differ
-
-**Single agent.** Your question goes to one `Helpful Assistant` agent and its
-answer appears in the chat. One model call, so it is the faster of the two.
-
-**Multi agent.** The assistant answers, then an `Editor` agent rewrites that
-answer to be shorter and clearer, and the chat shows the edited version. The
-original is kept under an expander so you can see what changed. Two model calls,
-so expect about twice the wait.
-
-The hand-off between them is one argument:
-
-```python
-edit_task = Task(
-    description="Improve the answer you were given ...",
-    agent=editor,
-    context=[answer_task],     # the editor receives the assistant's answer
-)
-```
-
-Without `context`, the editor would answer the question itself instead of
-editing.
-
-## Follow-up questions
-
-Streamlit re-runs the script on every interaction, so each app keeps the
-conversation in `st.session_state.messages` and pastes the last few turns into
-the task description. Ask "What is Python?" then "Who created it?" and the
-second answer knows what "it" refers to.
-
-## Pointing at a different model
-
-Pull the model, then change one line at the top of the `app.py` you are using:
-
-```bash
-ollama pull llama3.2:3b
-```
-
-```python
-MODEL = "llama3.2:3b"
-```
-
-`BASE_URL` sits next to it if your Ollama server is not on the default port.
-
-## One thing to be careful about
-
-Where each app builds its `LLM`, the model string is prefixed with `ollama/`:
-
-```python
-LLM(model="ollama/" + model, base_url=base_url)
-```
-
-That prefix is what tells CrewAI to use Ollama. **If you remove it, CrewAI treats
-the model as OpenAI's**, picks up an `OPENAI_API_KEY` from your environment if
-one is set, and sends your content to a hosted API. Keep the prefix.
-
-## Speed
-
-The model generates at a fixed rate, a few seconds per answer for
-`llama3.2:1b` on this machine. No code change moves that number, so what is left is
-not asking it for tokens you do not need, and not making it reload.
-
-**Answers are capped** at `max_tokens=600`. Left uncapped a small model pads and
-repeats, and you wait for text you would not read. Raise it in `app.py` if you
-want longer answers.
-
-**Keep the model loaded.** Ollama unloads an idle model after 5 minutes, and the
-next question then waits a couple of seconds for it to reload before anything
-happens. Pin it for half an hour:
-
-```bash
-curl http://localhost:11434/api/generate -d "{\"model\":\"llama3.2:1b\",\"prompt\":\"\",\"keep_alive\":\"30m\"}"
-```
-
-Setting `OLLAMA_KEEP_ALIVE=30m` in your environment makes that the default.
-
-**The single agent app is the faster one.** The multi agent app makes two model
-calls per question by design.
-
-### A note on streaming
-
-An earlier version of these apps streamed tokens into the page as they were
-produced, which made them feel much quicker even though the total time was the
-same. It needed a CrewAI event listener class, and these apps are deliberately
-plain, so it is not here. The chat shows a spinner and then the whole answer. If
-you want it back, CrewAI emits `LLMStreamChunkEvent` per token when the `LLM` is
-built with `stream=True`.
-
-### What did not work
-
-Tuning `num_thread` looked like a 33% gain on a single run. Repeated three times
-per setting the difference vanished: 35.1 tok/s default against 34.7 at four
-threads and 34.9 at six, which is measurement noise. It is not worth setting,
-and the first result was a reminder to repeat a benchmark before believing it.
-
-### If you need it genuinely faster
-
-The remaining levers are hardware and model size, not code:
-
-- A GPU is the real answer. Ollama uses it automatically when present.
-- Ask for shorter answers. Time scales almost linearly with tokens produced.
-- Use the single agent app.
-
-A *bigger* model such as `qwen2.5:3b` answers noticeably better but runs slower,
-so that trade runs the other way.
-
-## Which model, and why
-
-`llama3.2:1b` (1.3 GB) is the default. It is small enough to run on a laptop and
-answers in English without being told to.
-
-The project started on `qwen2.5:0.5b`, which is only 397 MB. It was dropped for
-one measured reason: Qwen2.5 is trained heavily on Chinese and answers a
-contentless prompt like "hi" in Chinese about 10% of the time.
-
-| Model | Size | Chinese reply to bare "hi" |
-|---|---|---|
-| `qwen2.5:0.5b` | 397 MB | 2 of 20 |
-| `llama3.2:1b` | 1.3 GB | 0 of 20 |
-
-There is no separate "English build" of Qwen to download. It is one multilingual
-model, so re-pulling the same tag changes nothing. The fixes are an explicit
-English instruction in the prompt, which both apps now carry anyway, or an
-English-first model, which is the route taken here.
-
-Either way this is a small model. It repeats itself and sometimes answers a
-slightly different question than the one you asked. To improve that, pull a
-bigger one and change `MODEL` at the top of the `app.py` you are using:
-
-```bash
-ollama pull llama3.2:3b
-```
+### 4. Risk Disclosures & Operational Notice
+- **Live Trading Safety**: Live execution is disabled by default (`live_trading_authorized = False`). Live execution requires explicit API credentials and user authorization.
+- **Transaction Costs**: On a 5-minute chart, taker fees (0.05%) and slippage (0.02%) represent significant transaction drag. Higher timeframes (15m, 1h) or maker limit orders are recommended for lower turnover.
