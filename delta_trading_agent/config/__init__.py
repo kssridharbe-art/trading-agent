@@ -1,3 +1,19 @@
-from .settings import CONFIG, TradingConfig, EMAMethod, TradingMode, PositionSide
+from .settings import (
+    CONFIG,
+    TradingConfig,
+    EMAMethod,
+    TradingMode,
+    PositionSide,
+    RegimeFilterType,
+    ExecutionType
+)
 
-__all__ = ["CONFIG", "TradingConfig", "EMAMethod", "TradingMode", "PositionSide"]
+__all__ = [
+    "CONFIG",
+    "TradingConfig",
+    "EMAMethod",
+    "TradingMode",
+    "PositionSide",
+    "RegimeFilterType",
+    "ExecutionType"
+]

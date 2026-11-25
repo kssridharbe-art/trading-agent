@@ -15,7 +15,7 @@ import hmac
 import hashlib
 import json
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import requests
 from ..config.settings import TradingConfig, PositionSide
 

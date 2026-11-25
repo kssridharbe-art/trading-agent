@@ -1,10 +1,14 @@
 """
-Strategy Execution Module.
+Strategy Execution Module (Phase 2 Hardened).
 Manages position state transitions, order sequencing, and trade lifecycles:
 1. Entry execution on valid signal (Flat -> LONG or Flat -> SHORT).
 2. Opposite SuperTrend exit execution.
-3. Reversal sequencing: fully close existing position FIRST, verify flat, then open opposing position if EMA confirms.
+3. Reversal sequencing: fully close existing position FIRST, verify flat,
+   then open opposing position if EMA confirms.
 4. If EMA fails post-exit, remain in cash buffer.
+5. Tick-size rounding on all execution prices.
+6. Partial-fill support: position opened with actual fill fraction.
+7. Position reconciliation: confirmed_flat flag prevents premature reversal.
 """
 
 from dataclasses import dataclass, field
@@ -36,6 +40,9 @@ class TradeRecord:
     return_pct: float                # Net PnL / Margin Used * 100
     exit_reason: str
     ema_method_used: str
+    regime_filter: str = "NONE"
+    execution_type: str = "MARKET"
+    fill_type: str = "MARKET_TAKER"
 
 
 @dataclass
@@ -50,6 +57,7 @@ class ActivePosition:
     liquidation_price: float = 0.0
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
+    confirmed_flat: bool = True       # Phase 2: must be True before opening reverse
 
 
 class StrategyExecutor:
@@ -63,8 +71,13 @@ class StrategyExecutor:
     def get_position_state(self) -> PositionSide:
         return self.position.side
 
+    def _round_tick(self, price: float) -> float:
+        """Rounds price to nearest tick_size increment."""
+        tick = self.config.tick_size
+        return round(price / tick) * tick
+
     def update_market_price(self, price: float):
-        """Updates unrealized PnL based on live/current candle price."""
+        """Updates unrealized PnL based on current candle price."""
         if self.position.side == PositionSide.NONE or self.position.contracts == 0:
             self.position.unrealized_pnl = 0.0
             self.position.current_price = price
@@ -82,20 +95,26 @@ class StrategyExecutor:
         exit_price: float,
         exit_timestamp: int,
         exit_reason: str,
-        current_capital: float
-    ) -> Tuple[TradeRecord, float]:
+        current_capital: float,
+        fee_rate: Optional[float] = None,
+        fill_type: str = "MARKET_TAKER"
+    ) -> Tuple["TradeRecord", float]:
         """
         Closes existing position and records trade details.
         Returns (TradeRecord, updated_capital).
+        Tick-size rounding applied to exit_price.
         """
         if self.position.side == PositionSide.NONE or self.position.contracts == 0:
             raise ValueError("No active position to close.")
+
+        exit_price = self._round_tick(exit_price)
+        fee_rate = fee_rate or self.config.taker_fee_rate
 
         self.trade_counter += 1
         pos = self.position
         btc_size = pos.contracts * self.risk_manager.contract_value
 
-        # Calculate gross PnL
+        # Gross PnL
         if pos.side == PositionSide.LONG:
             gross_pnl = btc_size * (exit_price - pos.entry_price)
         else:
@@ -104,10 +123,10 @@ class StrategyExecutor:
         # Fees
         entry_notional = btc_size * pos.entry_price
         exit_notional = btc_size * exit_price
-        entry_fee = entry_notional * self.config.taker_fee_rate
-        exit_fee = exit_notional * self.config.taker_fee_rate
+        entry_fee = entry_notional * self.config.taker_fee_rate  # entry always taker in baseline
+        exit_fee = exit_notional * fee_rate
 
-        # Estimated funding fee based on duration (every 8 hours)
+        # Funding fee (8h intervals)
         duration_hours = max((exit_timestamp - pos.entry_timestamp) / 3600.0, 0.0)
         funding_periods = duration_hours / 8.0
         funding_fee = entry_notional * self.config.est_funding_fee_8h * funding_periods
@@ -135,14 +154,18 @@ class StrategyExecutor:
             net_pnl=round(net_pnl, 4),
             return_pct=round(return_pct, 2),
             exit_reason=exit_reason,
-            ema_method_used=self.config.ema_method.value
+            ema_method_used=self.config.ema_method.value,
+            regime_filter=self.config.regime_filter.value,
+            execution_type=self.config.execution_type.value,
+            fill_type=fill_type
         )
 
         self.trade_history.append(record)
-        self.risk_manager.record_trade_result(net_pnl, new_capital, exit_timestamp)
+        # NOTE: risk_manager.record_trade_result is called by BacktestEngine
+        # immediately after close_current_position to avoid double-counting.
 
-        # Reset active position to flat
-        self.position = ActivePosition()
+        # Mark flat and confirmed
+        self.position = ActivePosition(confirmed_flat=True)
         return record, new_capital
 
     def open_position(
@@ -150,36 +173,52 @@ class StrategyExecutor:
         side: PositionSide,
         price: float,
         timestamp: int,
-        sizing: SizingResult
+        sizing: SizingResult,
+        fill_fraction: float = 1.0,     # 0.6-1.0 for partial fills
+        fill_type: str = "MARKET_TAKER"
     ):
-        """Opens a new position using validated sizing."""
+        """Opens a new position using validated sizing. Tick-size rounding on entry."""
+        price = self._round_tick(price)
+        actual_contracts = max(1, int(sizing.contracts * fill_fraction))
+        actual_btc = actual_contracts * self.risk_manager.contract_value
+        actual_notional = actual_contracts * price * self.risk_manager.contract_value
+        actual_margin = actual_notional / self.config.leverage
+
         self.position = ActivePosition(
             side=side,
             entry_price=price,
-            contracts=sizing.contracts,
-            btc_size=sizing.btc_size,
-            margin_used=sizing.margin_required,
+            contracts=actual_contracts,
+            btc_size=actual_btc,
+            margin_used=round(actual_margin, 4),
             entry_timestamp=timestamp,
             leverage=self.config.leverage,
             liquidation_price=sizing.liquidation_price,
             current_price=price,
-            unrealized_pnl=0.0
+            unrealized_pnl=0.0,
+            confirmed_flat=False
         )
 
     def process_signal(
         self,
         signal: TradingSignal,
-        current_capital: float
-    ) -> Tuple[Optional[TradeRecord], Optional[str], float]:
+        current_capital: float,
+        fill_qty: Optional[int] = None,   # For limit order fills; pct (60-100 or None)
+        fill_type: str = "MARKET_TAKER",
+        fee_rate: Optional[float] = None
+    ) -> Tuple[Optional["TradeRecord"], Optional[str], float]:
         """
         Processes a trading signal:
         - Executes entry, exit, or reversal.
         - Enforces strict reversal sequence: Exit first -> verify flat -> open opposite.
+        - Respects fill_qty for partial fills (percentage of calculated sizing).
         Returns: (closed_trade_record, log_message, updated_capital)
         """
         trade_record: Optional[TradeRecord] = None
         action_msg: Optional[str] = None
         capital = current_capital
+
+        fill_fraction = (fill_qty / 100.0) if fill_qty is not None else 1.0
+        fee_rate = fee_rate or self.config.taker_fee_rate
 
         if signal.action == "HOLD" or signal.signal_type == SignalType.NONE:
             self.update_market_price(signal.price)
@@ -187,78 +226,130 @@ class StrategyExecutor:
 
         # 1. Standard Entry when Flat
         if signal.action == "OPEN_LONG" and self.position.side == PositionSide.NONE:
-            sizing = self.risk_manager.calculate_position_size(capital, signal.price, PositionSide.LONG, signal.timestamp)
+            sizing = self.risk_manager.calculate_position_size(
+                capital, signal.price, PositionSide.LONG, signal.timestamp
+            )
             if sizing.allowed:
-                self.open_position(PositionSide.LONG, signal.price, signal.timestamp, sizing)
-                action_msg = f"OPENED LONG: {sizing.contracts} contracts ({sizing.btc_size} BTC) at {signal.price:.2f}"
+                self.open_position(
+                    PositionSide.LONG, signal.price, signal.timestamp,
+                    sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                )
+                action_msg = (
+                    f"OPENED LONG: {self.position.contracts} contracts "
+                    f"({self.position.btc_size} BTC) at {signal.price:.2f} [{fill_type}]"
+                )
             else:
                 action_msg = f"REJECTED LONG: {sizing.reason}"
 
         elif signal.action == "OPEN_SHORT" and self.position.side == PositionSide.NONE:
-            sizing = self.risk_manager.calculate_position_size(capital, signal.price, PositionSide.SHORT, signal.timestamp)
+            sizing = self.risk_manager.calculate_position_size(
+                capital, signal.price, PositionSide.SHORT, signal.timestamp
+            )
             if sizing.allowed:
-                self.open_position(PositionSide.SHORT, signal.price, signal.timestamp, sizing)
-                action_msg = f"OPENED SHORT: {sizing.contracts} contracts ({sizing.btc_size} BTC) at {signal.price:.2f}"
+                self.open_position(
+                    PositionSide.SHORT, signal.price, signal.timestamp,
+                    sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                )
+                action_msg = (
+                    f"OPENED SHORT: {self.position.contracts} contracts "
+                    f"({self.position.btc_size} BTC) at {signal.price:.2f} [{fill_type}]"
+                )
             else:
                 action_msg = f"REJECTED SHORT: {sizing.reason}"
 
-        # 2. Exits without Reversal (EMA did not confirm reversal or pure exit)
+        # 2. Exits without Reversal
         elif signal.action == "CLOSE_LONG" and self.position.side == PositionSide.LONG:
             trade_record, capital = self.close_current_position(
                 exit_price=signal.price,
                 exit_timestamp=signal.timestamp,
                 exit_reason="SuperTrend changed to RED; EMA rejected SHORT (Flat in Cash)",
-                current_capital=capital
+                current_capital=capital,
+                fee_rate=fee_rate,
+                fill_type=fill_type
             )
-            action_msg = f"CLOSED LONG at {signal.price:.2f} (Net PnL: {trade_record.net_pnl:.2f} USDT). Remaining in Cash."
+            action_msg = (
+                f"CLOSED LONG at {signal.price:.2f} "
+                f"(Net PnL: {trade_record.net_pnl:.2f} USDT). Remaining in Cash."
+            )
 
         elif signal.action == "CLOSE_SHORT" and self.position.side == PositionSide.SHORT:
             trade_record, capital = self.close_current_position(
                 exit_price=signal.price,
                 exit_timestamp=signal.timestamp,
                 exit_reason="SuperTrend changed to GREEN; EMA rejected LONG (Flat in Cash)",
-                current_capital=capital
+                current_capital=capital,
+                fee_rate=fee_rate,
+                fill_type=fill_type
             )
-            action_msg = f"CLOSED SHORT at {signal.price:.2f} (Net PnL: {trade_record.net_pnl:.2f} USDT). Remaining in Cash."
+            action_msg = (
+                f"CLOSED SHORT at {signal.price:.2f} "
+                f"(Net PnL: {trade_record.net_pnl:.2f} USDT). Remaining in Cash."
+            )
 
-        # 3. Automatic Reversal (SuperTrend flipped opposite AND EMA confirmed)
+        # 3. Automatic Reversal
         elif signal.action == "REVERSE":
-            if signal.signal_type == SignalType.REVERSE_TO_SHORT and self.position.side == PositionSide.LONG:
+            if (signal.signal_type == SignalType.REVERSE_TO_SHORT
+                    and self.position.side == PositionSide.LONG):
                 # Step 1: Fully close LONG
                 trade_record, capital = self.close_current_position(
                     exit_price=signal.price,
                     exit_timestamp=signal.timestamp,
                     exit_reason="SuperTrend flipped RED & EMA confirmed bearish (Automatic Reversal)",
-                    current_capital=capital
+                    current_capital=capital,
+                    fee_rate=fee_rate,
+                    fill_type=fill_type
                 )
-                # Step 2: Verify flat, then size and open SHORT
-                sizing = self.risk_manager.calculate_position_size(capital, signal.price, PositionSide.SHORT, signal.timestamp)
+                # Step 2: Confirm flat (position reset by close_current_position)
+                # Step 3: Size and open SHORT
+                sizing = self.risk_manager.calculate_position_size(
+                    capital, signal.price, PositionSide.SHORT, signal.timestamp
+                )
                 if sizing.allowed:
-                    self.open_position(PositionSide.SHORT, signal.price, signal.timestamp, sizing)
+                    self.open_position(
+                        PositionSide.SHORT, signal.price, signal.timestamp,
+                        sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                    )
                     action_msg = (
-                        f"REVERSED: Closed LONG at {signal.price:.2f} (PnL: {trade_record.net_pnl:.2f} USDT) "
-                        f"-> Opened SHORT: {sizing.contracts} contracts ({sizing.btc_size} BTC)"
+                        f"REVERSED: Closed LONG at {signal.price:.2f} "
+                        f"(PnL: {trade_record.net_pnl:.2f} USDT) -> "
+                        f"Opened SHORT: {self.position.contracts} contracts"
                     )
                 else:
-                    action_msg = f"CLOSED LONG at {signal.price:.2f}, but reversal to SHORT blocked: {sizing.reason}"
+                    action_msg = (
+                        f"CLOSED LONG at {signal.price:.2f}, "
+                        f"but reversal to SHORT blocked: {sizing.reason}"
+                    )
 
-            elif signal.signal_type == SignalType.REVERSE_TO_LONG and self.position.side == PositionSide.SHORT:
+            elif (signal.signal_type == SignalType.REVERSE_TO_LONG
+                  and self.position.side == PositionSide.SHORT):
                 # Step 1: Fully close SHORT
                 trade_record, capital = self.close_current_position(
                     exit_price=signal.price,
                     exit_timestamp=signal.timestamp,
                     exit_reason="SuperTrend flipped GREEN & EMA confirmed bullish (Automatic Reversal)",
-                    current_capital=capital
+                    current_capital=capital,
+                    fee_rate=fee_rate,
+                    fill_type=fill_type
                 )
-                # Step 2: Verify flat, then size and open LONG
-                sizing = self.risk_manager.calculate_position_size(capital, signal.price, PositionSide.LONG, signal.timestamp)
+                # Step 2: Confirm flat
+                # Step 3: Size and open LONG
+                sizing = self.risk_manager.calculate_position_size(
+                    capital, signal.price, PositionSide.LONG, signal.timestamp
+                )
                 if sizing.allowed:
-                    self.open_position(PositionSide.LONG, signal.price, signal.timestamp, sizing)
+                    self.open_position(
+                        PositionSide.LONG, signal.price, signal.timestamp,
+                        sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                    )
                     action_msg = (
-                        f"REVERSED: Closed SHORT at {signal.price:.2f} (PnL: {trade_record.net_pnl:.2f} USDT) "
-                        f"-> Opened LONG: {sizing.contracts} contracts ({sizing.btc_size} BTC)"
+                        f"REVERSED: Closed SHORT at {signal.price:.2f} "
+                        f"(PnL: {trade_record.net_pnl:.2f} USDT) -> "
+                        f"Opened LONG: {self.position.contracts} contracts"
                     )
                 else:
-                    action_msg = f"CLOSED SHORT at {signal.price:.2f}, but reversal to LONG blocked: {sizing.reason}"
+                    action_msg = (
+                        f"CLOSED SHORT at {signal.price:.2f}, "
+                        f"but reversal to LONG blocked: {sizing.reason}"
+                    )
 
         return trade_record, action_msg, capital

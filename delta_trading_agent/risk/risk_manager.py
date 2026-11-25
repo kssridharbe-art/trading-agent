@@ -1,19 +1,20 @@
 """
-Risk Management Module.
+Harden Risk Management Module (Phase 2).
 Implements:
 - 70% margin allocation limit per trade (leaving 30% unallocated capital)
 - Configurable leverage sizing
 - Position quantity calculation for Delta Exchange (0.001 BTC per contract)
-- Maximum daily loss circuit breaker
+- Maximum daily loss circuit breaker (including both realized and unrealized floating P&L)
 - Maximum consecutive losing trades circuit breaker
+- Maximum portfolio equity drawdown circuit breaker (max_total_drawdown_pct)
+- SQLite persistent risk state (restored on application restart)
 - Liquidation price estimation
 - Exchange minimum order validation
-- Protection against overleveraging
 """
 
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from ..config.settings import PositionSide, TradingConfig
 
 
@@ -30,8 +31,9 @@ class SizingResult:
 
 
 class RiskManager:
-    def __init__(self, config: TradingConfig):
+    def __init__(self, config: TradingConfig, db: Optional[Any] = None):
         self.config = config
+        self.db = db
         self.contract_value = 0.001  # 1 contract = 0.001 BTC
         self.maintenance_margin_rate = 0.005  # 0.5%
         
@@ -42,6 +44,44 @@ class RiskManager:
         self.consecutive_losses: int = 0
         self.circuit_breaker_active: bool = False
         self.circuit_breaker_reason: str = ""
+        self.peak_equity: float = config.initial_capital
+
+        # Restore persistent state from database if available
+        if self.db is not None:
+            self._restore_state_from_db()
+
+    def _persist_state(self):
+        """Saves current risk state to SQLite database."""
+        if self.db is not None and hasattr(self.db, "save_risk_state"):
+            d_str = self.current_day.isoformat() if self.current_day else datetime.now(timezone.utc).date().isoformat()
+            self.db.save_risk_state(
+                trading_date=d_str,
+                daily_start_capital=self.daily_start_capital,
+                daily_realized_pnl=self.daily_realized_pnl,
+                consecutive_losses=self.consecutive_losses,
+                circuit_breaker_active=self.circuit_breaker_active,
+                circuit_breaker_reason=self.circuit_breaker_reason,
+                peak_equity=self.peak_equity
+            )
+
+    def _restore_state_from_db(self):
+        """Restores risk state from SQLite to prevent bypassing circuit breakers on restart."""
+        try:
+            state = self.db.load_risk_state()
+            if state:
+                self.peak_equity = float(state.get("peak_equity", self.config.initial_capital))
+                if state.get("trading_date"):
+                    try:
+                        self.current_day = date.fromisoformat(state["trading_date"])
+                    except Exception:
+                        self.current_day = datetime.now(timezone.utc).date()
+                self.daily_start_capital = float(state.get("daily_start_capital", self.config.initial_capital))
+                self.daily_realized_pnl = float(state.get("daily_realized_pnl", 0.0))
+                self.consecutive_losses = int(state.get("consecutive_losses", 0))
+                self.circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
+                self.circuit_breaker_reason = str(state.get("circuit_breaker_reason", ""))
+        except Exception:
+            pass
 
     def reset_day_if_needed(self, current_capital: float, timestamp: Optional[int] = None):
         """Resets daily PnL counter when UTC day flips (using candle timestamp or system clock)."""
@@ -54,11 +94,53 @@ class RiskManager:
             self.current_day = now_date
             self.daily_start_capital = current_capital
             self.daily_realized_pnl = 0.0
-            # Reset circuit breakers on daily boundary
-            if self.circuit_breaker_active:
+            # Reset daily loss breaker on new UTC day if it was solely a daily loss breaker
+            if "daily loss limit" in self.circuit_breaker_reason.lower():
                 self.circuit_breaker_active = False
                 self.circuit_breaker_reason = ""
-            self.consecutive_losses = 0
+            self._persist_state()
+
+    def update_equity_and_check_drawdown(
+        self,
+        current_capital: float,
+        unrealized_pnl: float,
+        timestamp: Optional[int] = None
+    ) -> bool:
+        """
+        Monitors floating intraday loss and overall portfolio equity drawdown.
+        Returns True if a circuit breaker was triggered.
+        """
+        self.reset_day_if_needed(current_capital, timestamp)
+        total_equity = current_capital + unrealized_pnl
+
+        # 1. Update peak equity
+        if total_equity > self.peak_equity:
+            self.peak_equity = total_equity
+
+        # 2. Maximum Total Equity Drawdown Protection
+        if self.peak_equity > 0:
+            total_drawdown_pct = (self.peak_equity - total_equity) / self.peak_equity
+            if total_drawdown_pct >= self.config.max_total_drawdown_pct:
+                self.circuit_breaker_active = True
+                self.circuit_breaker_reason = (
+                    f"Hit maximum portfolio drawdown protection ({total_drawdown_pct*100:.2f}% >= {self.config.max_total_drawdown_pct*100:.2f}%)"
+                )
+                self._persist_state()
+                return True
+
+        # 3. Floating Intraday Daily Loss Check (Including Unrealized PnL)
+        if self.config.include_unrealized_in_daily_loss:
+            effective_daily_pnl = self.daily_realized_pnl + min(0.0, unrealized_pnl)
+            max_daily_loss = self.daily_start_capital * self.config.max_daily_loss_pct
+            if effective_daily_pnl <= -max_daily_loss:
+                self.circuit_breaker_active = True
+                self.circuit_breaker_reason = (
+                    f"Hit daily loss limit including floating loss ({effective_daily_pnl:.2f} USDT <= -{max_daily_loss:.2f} USDT)"
+                )
+                self._persist_state()
+                return True
+
+        return self.circuit_breaker_active
 
     def calculate_position_size(
         self,
@@ -203,3 +285,9 @@ class RiskManager:
             self.circuit_breaker_reason = (
                 f"Hit daily loss limit ({self.daily_realized_pnl:.2f} USDT <= -{max_daily_loss:.2f} USDT)"
             )
+
+        # Update peak equity
+        if current_capital > self.peak_equity:
+            self.peak_equity = current_capital
+
+        self._persist_state()

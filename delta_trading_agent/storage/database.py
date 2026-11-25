@@ -119,6 +119,21 @@ class DatabaseManager:
             )
             """)
 
+            # 6. Persistent Risk State Table (Survives application restarts)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS risk_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                trading_date TEXT NOT NULL,
+                daily_start_capital REAL NOT NULL,
+                daily_realized_pnl REAL NOT NULL,
+                consecutive_losses INTEGER NOT NULL,
+                circuit_breaker_active INTEGER NOT NULL,
+                circuit_breaker_reason TEXT NOT NULL,
+                peak_equity REAL NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
             conn.commit()
 
     def record_signal(self, symbol: str, signal: TradingSignal):
@@ -226,3 +241,43 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM equity_snapshots ORDER BY timestamp ASC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def save_risk_state(
+        self,
+        trading_date: str,
+        daily_start_capital: float,
+        daily_realized_pnl: float,
+        consecutive_losses: int,
+        circuit_breaker_active: bool,
+        circuit_breaker_reason: str,
+        peak_equity: float
+    ):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT OR REPLACE INTO risk_state (
+                id, trading_date, daily_start_capital, daily_realized_pnl,
+                consecutive_losses, circuit_breaker_active, circuit_breaker_reason,
+                peak_equity, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                trading_date,
+                daily_start_capital,
+                daily_realized_pnl,
+                consecutive_losses,
+                1 if circuit_breaker_active else 0,
+                circuit_breaker_reason,
+                peak_equity
+            ))
+            conn.commit()
+
+    def load_risk_state(self) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM risk_state WHERE id = 1")
+            row = cursor.fetchone()
+            if row:
+                d = dict(row)
+                d["circuit_breaker_active"] = bool(d["circuit_breaker_active"])
+                return d
+            return None

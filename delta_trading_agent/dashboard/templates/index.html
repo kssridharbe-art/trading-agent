@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Delta Exchange - BTCUSD Automated Trading Agent</title>
+    <title>Delta Exchange - BTCUSD Automated Trading Agent (Phase 2)</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -14,11 +14,11 @@
     <header class="app-header">
         <div class="logo-area">
             <div class="status-indicator live"></div>
-            <h1>DELTA QUANT AGENT <span>BTC/USDT 5M PERPETUAL</span></h1>
+            <h1>DELTA QUANT AGENT <span>BTC/USDT PERPETUAL (PHASE 2 HARDENED)</span></h1>
         </div>
         <div class="header-controls">
             <div class="circuit-status" id="circuitStatusBadge">SYSTEM NORMAL</div>
-            <div class="mode-badge" id="tradingModeBadge">PAPER TRADING</div>
+            <div class="mode-badge" id="tradingModeBadge">PAPER TRADING (SAFE)</div>
             <button class="btn btn-danger" id="emergencyCloseBtn">EMERGENCY CLOSE</button>
         </div>
     </header>
@@ -26,7 +26,7 @@
     <div class="dashboard-grid">
         <!-- 1. ACCOUNT OVERVIEW CARD -->
         <div class="card account-card">
-            <div class="card-title">ACCOUNT & MARGIN OVERVIEW</div>
+            <div class="card-title">ACCOUNT & RISK MANAGEMENT</div>
             <div class="metric-row">
                 <div class="metric">
                     <span class="label">Total Capital</span>
@@ -51,7 +51,7 @@
                     <span class="value" id="valAvailableMargin">7,000.00 USDT</span>
                 </div>
                 <div class="metric">
-                    <span class="label">Unallocated Cash (30% Buffer)</span>
+                    <span class="label">Unallocated Cash (30%)</span>
                     <span class="value" id="valUnallocatedCash">3,000.00 USDT</span>
                 </div>
             </div>
@@ -59,7 +59,7 @@
 
         <!-- 2. MARKET & SIGNAL OVERVIEW CARD -->
         <div class="card market-card">
-            <div class="card-title">MARKET DATA & LIVE SIGNALS</div>
+            <div class="card-title">MARKET REGIME & LIVE SIGNALS</div>
             <div class="metric-row">
                 <div class="metric">
                     <span class="label">BTC Price (Live)</span>
@@ -78,7 +78,7 @@
             </div>
             <div class="signal-alert-box" id="signalAlertBox">
                 <div class="signal-type" id="signalType">LATEST SIGNAL: NONE</div>
-                <div class="signal-reason" id="signalReason">Awaiting first 5-minute candle completion...</div>
+                <div class="signal-reason" id="signalReason">Awaiting completed candle evaluation...</div>
             </div>
         </div>
 
@@ -115,29 +115,62 @@
             </div>
         </div>
 
-        <!-- 4. STRATEGY CONFIGURATION PANEL -->
+        <!-- 4. STRATEGY CONFIGURATION & PHASE 2 REGIME SELECTOR -->
         <div class="card config-card">
-            <div class="card-title">STRATEGY PARAMETERS & CONTROLS</div>
+            <div class="card-title">STRATEGY PARAMETERS & REGIME FILTERS</div>
             <form id="configForm" class="config-grid">
                 <div class="form-group">
-                    <label for="selectEMAMethod">EMA 9 Confirmation Method:</label>
+                    <label for="selectTimeframe">Timeframe:</label>
+                    <select id="selectTimeframe" class="form-control">
+                        <option value="5m" selected>5 Minutes (5m)</option>
+                        <option value="15m">15 Minutes (15m)</option>
+                        <option value="1h">1 Hour (1h)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="selectRegimeFilter">Market Regime Filter:</label>
+                    <select id="selectRegimeFilter" class="form-control">
+                        <option value="NONE" selected>Baseline (No Filter)</option>
+                        <option value="ADX_ONLY">ADX Trend Strength Filter</option>
+                        <option value="ATR_ONLY">ATR Volatility Filter</option>
+                        <option value="BOTH">Both ADX & ATR Required</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="selectExecutionType">Execution Model:</label>
+                    <select id="selectExecutionType" class="form-control">
+                        <option value="MARKET" selected>Market Order (Taker 0.05% + Slippage 0.02%)</option>
+                        <option value="POST_ONLY_LIMIT">Post-Only Limit (Maker 0.02% Passive)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="selectEMAMethod">EMA 9 Method:</label>
                     <select id="selectEMAMethod" class="form-control">
-                        <option value="METHOD_C" selected>Method C: Both Candle Position & Slope (Default)</option>
+                        <option value="METHOD_C" selected>Method C: Both Close & Slope (Default)</option>
                         <option value="METHOD_A">Method A: Candle Close Above/Below EMA</option>
                         <option value="METHOD_B">Method B: EMA 9 Slope Upward/Downward</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="inputLeverage">Leverage Multiplier:</label>
+                    <label for="inputLeverage">Leverage (1x - 100x):</label>
                     <input type="number" id="inputLeverage" class="form-control" min="1" max="100" value="10">
                 </div>
                 <div class="form-group">
-                    <label for="inputMarginPct">Margin Allocation % (Default 70%):</label>
+                    <label for="inputMarginPct">Margin Allocation %:</label>
                     <input type="number" id="inputMarginPct" class="form-control" min="10" max="95" value="70">
                 </div>
-                <div class="form-group form-actions">
-                    <button type="submit" class="btn btn-primary">SAVE PARAMETERS</button>
-                    <button type="button" class="btn btn-secondary" id="btnOpenBacktestModal">RUN BACKTEST</button>
+                <div class="form-group">
+                    <label for="inputADXThreshold">ADX Min Threshold:</label>
+                    <input type="number" id="inputADXThreshold" class="form-control" min="5" max="50" value="20" step="1">
+                </div>
+                <div class="form-group">
+                    <label for="inputATRThreshold">ATR Min Volatility %:</label>
+                    <input type="number" id="inputATRThreshold" class="form-control" min="0.01" max="2.0" value="0.15" step="0.01">
+                </div>
+                <div class="form-group form-actions" style="grid-column: span 2;">
+                    <button type="submit" class="btn btn-primary">APPLY PARAMETERS</button>
+                    <button type="button" class="btn btn-secondary" id="btnOpenBacktestModal">COMPARATIVE BACKTEST</button>
+                    <button type="button" class="btn btn-outline" id="btnOpenMatrixModal">VIEW 24-CONFIG MATRIX</button>
                 </div>
             </form>
         </div>
@@ -145,7 +178,7 @@
 
     <!-- 5. TRADE EXECUTION HISTORY TABLE -->
     <div class="card table-card">
-        <div class="card-title">COMPLETED TRADING HISTORY (DELTA EXCHANGE REVERSAL STRATEGY)</div>
+        <div class="card-title">RECENT TRADE EXECUTION HISTORY</div>
         <div class="table-responsive">
             <table class="data-table">
                 <thead>
@@ -171,35 +204,101 @@
         </div>
     </div>
 
-    <!-- 6. BACKTEST MODAL -->
+    <!-- 6. BACKTEST MODAL WITH BASELINE COMPARISON -->
     <div class="modal" id="backtestModal">
-        <div class="modal-content">
+        <div class="modal-content" style="max-width: 1000px;">
             <div class="modal-header">
-                <h2>HISTORICAL BACKTEST ANALYZER</h2>
+                <h2>HISTORICAL BACKTEST ANALYZER & BASELINE COMPARISON</h2>
                 <button class="close-btn" id="btnCloseBacktestModal">&times;</button>
             </div>
             <div class="modal-body">
-                <div class="backtest-controls">
-                    <label>Historical Days:
-                        <input type="number" id="btDays" value="14" min="1" max="90">
+                <div class="backtest-controls" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 15px;">
+                    <label>Days:
+                        <input type="number" id="btDays" value="30" min="1" max="90" class="form-control">
                     </label>
-                    <label>EMA Method:
-                        <select id="btMethod">
-                            <option value="METHOD_A">Method A (Close)</option>
-                            <option value="METHOD_B">Method B (Slope)</option>
-                            <option value="METHOD_C">Method C (Both)</option>
+                    <label>Timeframe:
+                        <select id="btTimeframe" class="form-control">
+                            <option value="5m" selected>5m</option>
+                            <option value="15m">15m</option>
+                            <option value="1h">1h</option>
                         </select>
                     </label>
-                    <button class="btn btn-primary" id="btnExecuteBacktest">START SIMULATION</button>
+                    <label>Regime Filter:
+                        <select id="btRegimeFilter" class="form-control">
+                            <option value="NONE">NONE (Baseline)</option>
+                            <option value="ADX_ONLY" selected>ADX ONLY</option>
+                            <option value="ATR_ONLY">ATR ONLY</option>
+                            <option value="BOTH">BOTH (ADX+ATR)</option>
+                        </select>
+                    </label>
+                    <label>Execution:
+                        <select id="btExecutionType" class="form-control">
+                            <option value="MARKET" selected>MARKET</option>
+                            <option value="POST_ONLY_LIMIT">POST-ONLY LIMIT</option>
+                        </select>
+                    </label>
+                    <label>EMA Method:
+                        <select id="btMethod" class="form-control">
+                            <option value="METHOD_C" selected>Method C</option>
+                            <option value="METHOD_A">Method A</option>
+                            <option value="METHOD_B">Method B</option>
+                        </select>
+                    </label>
+                    <div style="display: flex; align-items: flex-end;">
+                        <button class="btn btn-primary" id="btnExecuteBacktest" style="width: 100%; height: 38px;">RUN TEST</button>
+                    </div>
                 </div>
-                <div id="btLoadingSpinner" class="loading-state" style="display:none;">
-                    Downloading candles and running bar-by-bar simulation...
+
+                <div id="btLoadingSpinner" class="loading-state" style="display:none; text-align: center; padding: 20px;">
+                    Running simulation across historical candles...
                 </div>
+
                 <div id="btResultsArea" style="display:none;">
+                    <!-- Comparison Highlights -->
+                    <div class="comparison-header" id="btComparisonHeader" style="margin-bottom: 15px;"></div>
                     <div class="stats-grid" id="btStatsGrid"></div>
-                    <div class="chart-wrapper">
+                    <div class="chart-wrapper" style="margin-top: 20px; height: 360px;">
                         <canvas id="equityChartCanvas"></canvas>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 7. FULL 24-CONFIG PERFORMANCE MATRIX MODAL -->
+    <div class="modal" id="matrixModal">
+        <div class="modal-content" style="max-width: 1200px; width: 95%;">
+            <div class="modal-header">
+                <h2>PHASE 2 COMPARATIVE MATRIX (24 CONFIGURATIONS AUDITED)</h2>
+                <button class="close-btn" id="btnCloseMatrixModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: #888; font-size: 0.85rem; margin-bottom: 12px;">
+                    Independent 30-day comparative validation across timeframes (5m, 15m, 1h), regime filters (NONE, ADX, ATR, BOTH),
+                    and execution types (MARKET vs LIMIT) with in-sample and out-of-sample splits.
+                </p>
+                <div class="table-responsive" style="max-height: 550px; overflow-y: auto;">
+                    <table class="data-table" id="matrixTable">
+                        <thead>
+                            <tr>
+                                <th>TF</th>
+                                <th>Filter</th>
+                                <th>Exec</th>
+                                <th>Trades</th>
+                                <th>Win %</th>
+                                <th>Gross PnL</th>
+                                <th>Fees</th>
+                                <th>Net PnL</th>
+                                <th>Return %</th>
+                                <th>Profit Factor</th>
+                                <th>Max DD %</th>
+                                <th>OOS Net PnL</th>
+                            </tr>
+                        </thead>
+                        <tbody id="matrixTableBody">
+                            <tr><td colspan="12" class="empty-state">Loading comparative results...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
