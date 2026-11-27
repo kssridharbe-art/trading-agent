@@ -94,8 +94,9 @@ class RiskManager:
             self.current_day = now_date
             self.daily_start_capital = current_capital
             self.daily_realized_pnl = 0.0
-            # Reset daily loss breaker on new UTC day if it was solely a daily loss breaker
-            if "daily loss limit" in self.circuit_breaker_reason.lower():
+            self.consecutive_losses = 0
+            # Reset daily circuit breakers at UTC midnight (unless portfolio drawdown protection was tripped)
+            if "portfolio drawdown" not in self.circuit_breaker_reason.lower():
                 self.circuit_breaker_active = False
                 self.circuit_breaker_reason = ""
             self._persist_state()

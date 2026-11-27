@@ -1,15 +1,14 @@
 """
 Historical Backtesting Engine for BTCUSD / BTCUSDT Perpetual on Delta Exchange.
-Phase 2 Enhanced:
-- SuperTrend (10, 3) + EMA 9 (Method A/B/C)
-- Optional ADX Trend-Strength and ATR Volatility filters
-- Multi-timeframe support: 5m, 15m, 1h (resolution="5","15","60")
-- Hardened risk manager with per-bar unrealized loss check
-- Execution model: MARKET or POST_ONLY_LIMIT with partial fills
-- Tick-size rounding (0.5 USDT)
-- Correct directional slippage per signal type (REVERSE_TO_LONG vs REVERSE_TO_SHORT)
-- Zero lookahead bias – indicators update on completed candle only
-- Live trading ALWAYS disabled (live_trading_authorized = False)
+Phase 2.1 Audit Corrected:
+- Strict P&L reconciliation: Gross PnL - Total Fees & Funding = Net PnL.
+- Discrete modeling of Exit orders vs Entry orders.
+- Realistic Limit execution: touch validation, unfilled entry cancellations, timeout taker exits.
+- Maker fees (0.02%) applied exclusively to confirmed maker fills.
+- Multi-timeframe support: 5m, 15m, 1h.
+- Per-bar unrealized drawdown monitoring.
+- Zero lookahead bias.
+- Live trading strictly disabled (live_trading_authorized = False).
 """
 
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ from ..indicators.atr import StatefulATR
 from ..signals.signal_generator import SignalGenerator, TradingSignal, SignalType
 from ..risk.risk_manager import RiskManager
 from ..execution.strategy_executor import StrategyExecutor, TradeRecord
-from ..execution.execution_model import ExecutionModel, FilledOrder
+from ..execution.execution_model import ExecutionModel, OrderFillResult
 from .performance import calculate_performance, PerformanceSummary
 
 
@@ -37,6 +36,7 @@ class BacktestResult:
     summary: PerformanceSummary
     trades: List[TradeRecord]
     equity_curve: List[Dict[str, Any]]
+    signals_log: List[Dict[str, Any]]
     candle_count: int
     start_date: str
     end_date: str
@@ -45,7 +45,6 @@ class BacktestResult:
     timeframe: str
 
 
-# Resolution string -> seconds per bar
 _RESOLUTION_SECONDS: Dict[str, int] = {
     "5": 300,
     "15": 900,
@@ -56,7 +55,6 @@ _RESOLUTION_SECONDS: Dict[str, int] = {
 class BacktestEngine:
     def __init__(self, config: Optional[TradingConfig] = None):
         self.config = config or TradingConfig()
-        # Safety: backtest never touches live orders
         self.config.live_trading_authorized = False
         self._init_components()
 
@@ -89,31 +87,20 @@ class BacktestEngine:
         days: int = 30,
         api_base: str = "https://api.delta.exchange"
     ) -> pd.DataFrame:
-        """
-        Fetches historical candles from Delta Exchange chart/history API.
-        resolution: "5" (5m), "15" (15m), "60" (1h)
-        Paginates backwards to retrieve up to `days` of historical candles.
-        """
+        """Fetches historical candles from Delta Exchange chart/history API."""
         now = int(time.time())
         from_time = now - (days * 86400)
         all_candles = []
-
         bar_secs = _RESOLUTION_SECONDS.get(resolution, 300)
-        # Fetch ~1000 bars per request
         chunk_seconds = bar_secs * 1000
 
         cur_to = now
-        label = {
-            "5": "5-minute", "15": "15-minute", "60": "1-hour"
-        }.get(resolution, resolution)
+        label = {"5": "5-minute", "15": "15-minute", "60": "1-hour"}.get(resolution, resolution)
         print(f"Fetching {days} days of {symbol} {label} candles from Delta Exchange...")
 
         while cur_to > from_time:
             cur_from = max(cur_to - chunk_seconds, from_time)
-            url = (
-                f"{api_base}/v2/chart/history"
-                f"?symbol={symbol}&resolution={resolution}&from={cur_from}&to={cur_to}"
-            )
+            url = f"{api_base}/v2/chart/history?symbol={symbol}&resolution={resolution}&from={cur_from}&to={cur_to}"
             try:
                 res = requests.get(url, timeout=15)
                 if res.status_code == 200:
@@ -136,9 +123,7 @@ class BacktestEngine:
             cur_to = cur_from
 
         if not all_candles:
-            raise RuntimeError(
-                f"Failed to fetch historical candles for {symbol} (resolution={resolution}) from {api_base}"
-            )
+            raise RuntimeError(f"Failed to fetch historical candles for {symbol} (resolution={resolution})")
 
         df = pd.concat(all_candles, ignore_index=True)
         df.drop_duplicates(subset=["timestamp"], inplace=True)
@@ -149,25 +134,19 @@ class BacktestEngine:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df.dropna(subset=["close"], inplace=True)
         df.reset_index(drop=True, inplace=True)
-
-        print(f"Retrieved {len(df)} {label} candles ({df['timestamp'].iloc[0]} -> {df['timestamp'].iloc[-1]})")
         return df
 
     def run(self, df: pd.DataFrame) -> BacktestResult:
-        """
-        Runs the backtest bar-by-bar on a completed-candle DataFrame.
-        Expected columns: timestamp, open, high, low, close (volume optional).
-        """
-        # Re-initialize all stateful objects so the engine is reusable
+        """Runs the bar-by-bar backtest across completed candles."""
         self._init_components()
 
         capital = self.config.initial_capital
         equity_records: List[Dict[str, Any]] = []
         equity_values: List[float] = [capital]
+        signals_log: List[Dict[str, Any]] = []
 
-        # Pending limit order state
-        pending_limit: Optional[Dict[str, Any]] = None
-        limit_bars_waiting = 0
+        pending_exit: Optional[Dict[str, Any]] = None
+        pending_entry: Optional[Dict[str, Any]] = None
 
         for i, row in df.iterrows():
             ts = int(row["timestamp"])
@@ -175,47 +154,94 @@ class BacktestEngine:
             low = float(row["low"])
             close = float(row["close"])
 
-            # ── 1. Try to fill any outstanding limit order on this bar ──────
-            if pending_limit is not None:
-                fill = self.execution_model.try_fill_limit(
-                    pending_order=pending_limit,
+            # ── 1. Process Pending Limit Exit (Priority: must close existing pos first) ──
+            if pending_exit is not None:
+                fill_res = self.execution_model.check_limit_exit_fill(
+                    is_closing_long=pending_exit["is_closing_long"],
+                    limit_price=pending_exit["limit_price"],
                     bar_high=high,
                     bar_low=low,
                     bar_close=close,
-                    bars_waiting=limit_bars_waiting
+                    bars_waiting=pending_exit["bars_waiting"]
                 )
-                if fill.filled:
-                    # Apply the pending action with the actual fill price
-                    _signal = pending_limit["signal"]
-                    _signal.price = fill.fill_price
-                    closed_trade, _, capital = self.executor.process_signal(
-                        _signal, capital, fill_qty=fill.fill_qty
+                if fill_res.filled:
+                    trade_record, capital = self.executor.close_current_position(
+                        exit_price=fill_res.fill_price,
+                        exit_timestamp=ts,
+                        exit_reason=pending_exit["reason"],
+                        current_capital=capital,
+                        fee_rate=fill_res.fee_rate,
+                        fill_type=fill_res.fill_type
                     )
-                    if closed_trade:
-                        self.risk_manager.record_trade_result(closed_trade.net_pnl, capital, ts)
-                    pending_limit = None
-                    limit_bars_waiting = 0
-                elif fill.timed_out:
-                    pending_limit = None
-                    limit_bars_waiting = 0
-                else:
-                    limit_bars_waiting += 1
+                    self.risk_manager.record_trade_result(trade_record.net_pnl, capital, ts)
 
-            # ── 2. Update indicators (completed candle, no lookahead) ────────
+                    # If this exit was the first leg of a reversal, now activate the followup entry
+                    if pending_exit.get("followup_entry"):
+                        f_entry = pending_exit["followup_entry"]
+                        f_entry["limit_price"] = self.execution_model.calc_entry_limit_price(
+                            is_buy=f_entry["is_buy"], close=close
+                        )
+                        f_entry["bars_waiting"] = 0
+                        f_entry["placed_ts"] = ts
+                        pending_entry = f_entry
+
+                    pending_exit = None
+                else:
+                    pending_exit["bars_waiting"] += 1
+
+            # ── 2. Process Pending Limit Entry (Only when flat) ─────────────────────────
+            elif pending_entry is not None and self.executor.position.side == PositionSide.NONE:
+                fill_res = self.execution_model.check_limit_entry_fill(
+                    is_buy=pending_entry["is_buy"],
+                    limit_price=pending_entry["limit_price"],
+                    bar_high=high,
+                    bar_low=low,
+                    bar_close=close,
+                    bars_waiting=pending_entry["bars_waiting"]
+                )
+                if fill_res.filled:
+                    sizing = self.risk_manager.calculate_position_size(
+                        capital, fill_res.fill_price, pending_entry["side"], ts
+                    )
+                    if sizing.allowed:
+                        self.executor.open_position(
+                            side=pending_entry["side"],
+                            price=fill_res.fill_price,
+                            timestamp=ts,
+                            sizing=sizing,
+                            fill_fraction=fill_res.fill_fraction,
+                            fill_type=fill_res.fill_type,
+                            fee_rate=fill_res.fee_rate
+                        )
+                    pending_entry = None
+                elif fill_res.cancelled:
+                    # Unfilled entry timed out and cancelled! Remain flat in cash
+                    signals_log.append({
+                        "timestamp": ts,
+                        "action": "CANCELLED_UNFILLED",
+                        "side": pending_entry["side"].value,
+                        "limit_price": pending_entry["limit_price"],
+                        "reason": "Entry limit order timed out without price touch; cancelled"
+                    })
+                    pending_entry = None
+                else:
+                    pending_entry["bars_waiting"] += 1
+
+            # ── 3. Update Indicators on Completed Candle (Zero Lookahead) ───────────────
             st_res = self.supertrend.update(high, low, close)
             ema_res = self.ema.update(close)
             adx_res = self.adx.update(high, low, close)
             atr_res = self.atr.update(high, low, close)
 
             if st_res is None or ema_res is None:
-                continue   # Still warming up SuperTrend or EMA
+                continue
 
-            # ── 3. Per-bar unrealized drawdown check ─────────────────────────
+            # ── 4. Per-Bar Floating Drawdown Check ──────────────────────────────────────
             self.executor.update_market_price(close)
             unrealized = self.executor.position.unrealized_pnl
             self.risk_manager.update_equity_and_check_drawdown(capital, unrealized, ts)
 
-            # ── 4. Generate signal on completed candle ───────────────────────
+            # ── 5. Evaluate Completed Candle Signal ─────────────────────────────────────
             current_pos_side = self.executor.get_position_state()
             signal = self.signal_generator.evaluate(
                 candle_timestamp=ts,
@@ -227,30 +253,106 @@ class BacktestEngine:
                 atr_res=atr_res
             )
 
-            # ── 5. Execute signal through execution model ────────────────────
+            # ── 6. Process Evaluated Signal ─────────────────────────────────────────────
             if signal.action not in ("HOLD",) and signal.signal_type != SignalType.NONE:
+                sig_record = {
+                    "timestamp": ts,
+                    "signal_type": signal.signal_type.value,
+                    "action": signal.action,
+                    "price": close,
+                    "supertrend_direction": signal.supertrend_direction,
+                    "ema_confirmed": signal.ema_confirmed,
+                    "regime_passed": signal.regime_passed,
+                    "reason": signal.reason,
+                    "execution_status": "PROCESSED"
+                }
+
+                # Case A: Market Execution Model
                 if self.config.execution_type == ExecutionType.MARKET:
-                    # Market order: immediate fill with correct directional slippage
-                    exec_price = self._apply_market_slippage(signal, close)
-                    signal.price = exec_price
-                    closed_trade, action_msg, capital = self.executor.process_signal(signal, capital)
-                    if closed_trade:
-                        self.risk_manager.record_trade_result(closed_trade.net_pnl, capital, ts)
+                    if signal.action == "OPEN_LONG":
+                        fill = self.execution_model.execute_market_order(is_buy=True, close=close)
+                        sizing = self.risk_manager.calculate_position_size(capital, fill.fill_price, PositionSide.LONG, ts)
+                        if sizing.allowed:
+                            self.executor.open_position(PositionSide.LONG, fill.fill_price, ts, sizing, fee_rate=fill.fee_rate, fill_type=fill.fill_type)
+                            sig_record["execution_status"] = "FILLED_MARKET"
+                        else:
+                            sig_record["execution_status"] = f"REJECTED: {sizing.reason}"
 
+                    elif signal.action == "OPEN_SHORT":
+                        fill = self.execution_model.execute_market_order(is_buy=False, close=close)
+                        sizing = self.risk_manager.calculate_position_size(capital, fill.fill_price, PositionSide.SHORT, ts)
+                        if sizing.allowed:
+                            self.executor.open_position(PositionSide.SHORT, fill.fill_price, ts, sizing, fee_rate=fill.fee_rate, fill_type=fill.fill_type)
+                            sig_record["execution_status"] = "FILLED_MARKET"
+                        else:
+                            sig_record["execution_status"] = f"REJECTED: {sizing.reason}"
+
+                    elif signal.action in ("CLOSE_LONG", "CLOSE_SHORT"):
+                        is_closing_long = (signal.action == "CLOSE_LONG")
+                        fill = self.execution_model.execute_market_order(is_buy=(not is_closing_long), close=close)
+                        trade, capital = self.executor.close_current_position(
+                            exit_price=fill.fill_price, exit_timestamp=ts, exit_reason=signal.reason,
+                            current_capital=capital, fee_rate=fill.fee_rate, fill_type=fill.fill_type
+                        )
+                        self.risk_manager.record_trade_result(trade.net_pnl, capital, ts)
+                        sig_record["execution_status"] = "CLOSED_MARKET"
+
+                    elif signal.action == "REVERSE":
+                        # Reversal: close existing first -> confirm flat -> open reverse
+                        is_closing_long = (self.executor.position.side == PositionSide.LONG)
+                        fill_exit = self.execution_model.execute_market_order(is_buy=(not is_closing_long), close=close)
+                        trade, capital = self.executor.close_current_position(
+                            exit_price=fill_exit.fill_price, exit_timestamp=ts, exit_reason=signal.reason,
+                            current_capital=capital, fee_rate=fill_exit.fee_rate, fill_type=fill_exit.fill_type
+                        )
+                        self.risk_manager.record_trade_result(trade.net_pnl, capital, ts)
+
+                        new_side = PositionSide.SHORT if is_closing_long else PositionSide.LONG
+                        fill_entry = self.execution_model.execute_market_order(is_buy=(new_side == PositionSide.LONG), close=close)
+                        sizing = self.risk_manager.calculate_position_size(capital, fill_entry.fill_price, new_side, ts)
+                        if sizing.allowed:
+                            self.executor.open_position(new_side, fill_entry.fill_price, ts, sizing, fee_rate=fill_entry.fee_rate, fill_type=fill_entry.fill_type)
+                            sig_record["execution_status"] = "REVERSED_MARKET"
+                        else:
+                            sig_record["execution_status"] = f"REVERSE_ENTRY_BLOCKED: {sizing.reason}"
+
+                # Case B: Post-Only Limit Execution Model
                 elif self.config.execution_type == ExecutionType.POST_ONLY_LIMIT:
-                    # Post-only limit: place and queue; will try to fill next bar(s)
-                    limit_price = self.execution_model.calc_limit_price(signal, close)
-                    signal.price = limit_price
-                    pending_limit = {
-                        "signal": signal,
-                        "limit_price": limit_price,
-                        "side": signal.signal_type,
-                        "timeout_bars": self.config.limit_timeout_bars,
-                        "timestamp": ts
-                    }
-                    limit_bars_waiting = 0
+                    if signal.action == "OPEN_LONG":
+                        limit_p = self.execution_model.calc_entry_limit_price(is_buy=True, close=close)
+                        pending_entry = {"is_buy": True, "side": PositionSide.LONG, "limit_price": limit_p, "bars_waiting": 0, "ts": ts}
+                        sig_record["execution_status"] = f"PLACED_LIMIT_ENTRY @ {limit_p}"
 
-            # ── 6. Record equity snapshot ────────────────────────────────────
+                    elif signal.action == "OPEN_SHORT":
+                        limit_p = self.execution_model.calc_entry_limit_price(is_buy=False, close=close)
+                        pending_entry = {"is_buy": False, "side": PositionSide.SHORT, "limit_price": limit_p, "bars_waiting": 0, "ts": ts}
+                        sig_record["execution_status"] = f"PLACED_LIMIT_ENTRY @ {limit_p}"
+
+                    elif signal.action in ("CLOSE_LONG", "CLOSE_SHORT"):
+                        is_closing_long = (signal.action == "CLOSE_LONG")
+                        limit_exit_p = self.execution_model.calc_exit_limit_price(is_closing_long=is_closing_long, close=close)
+                        pending_exit = {"is_closing_long": is_closing_long, "limit_price": limit_exit_p, "reason": signal.reason, "bars_waiting": 0, "ts": ts}
+                        sig_record["execution_status"] = f"PLACED_LIMIT_EXIT @ {limit_exit_p}"
+
+                    elif signal.action == "REVERSE":
+                        # Exit order placed first; followup entry staged
+                        is_closing_long = (self.executor.position.side == PositionSide.LONG)
+                        limit_exit_p = self.execution_model.calc_exit_limit_price(is_closing_long=is_closing_long, close=close)
+                        new_side = PositionSide.SHORT if is_closing_long else PositionSide.LONG
+                        followup = {"is_buy": (new_side == PositionSide.LONG), "side": new_side, "limit_price": 0.0, "bars_waiting": 0, "ts": ts}
+                        pending_exit = {
+                            "is_closing_long": is_closing_long,
+                            "limit_price": limit_exit_p,
+                            "reason": signal.reason,
+                            "bars_waiting": 0,
+                            "ts": ts,
+                            "followup_entry": followup
+                        }
+                        sig_record["execution_status"] = f"PLACED_LIMIT_REVERSAL_EXIT @ {limit_exit_p}"
+
+                signals_log.append(sig_record)
+
+            # ── 7. Record Equity Curve Snapshot ─────────────────────────────────────────
             self.executor.update_market_price(close)
             unrealized = self.executor.position.unrealized_pnl
             total_equity = capital + unrealized
@@ -271,14 +373,16 @@ class BacktestEngine:
                 "regime_passed": signal.regime_passed
             })
 
-        # ── 7. Force-close any open position at last bar close ───────────────
+        # ── 8. Final Liquidation at Backtest End ────────────────────────────────────────
         if self.executor.position.side != PositionSide.NONE:
             last_row = df.iloc[-1]
             final_trade, capital = self.executor.close_current_position(
                 exit_price=float(last_row["close"]),
                 exit_timestamp=int(last_row["timestamp"]),
-                exit_reason="End of Backtest Period – Forced Liquidation",
-                current_capital=capital
+                exit_reason="End of Backtest Period – Final Liquidation",
+                current_capital=capital,
+                fee_rate=self.config.taker_fee_rate,
+                fill_type="FINAL_LIQUIDATION"
             )
             equity_values.append(capital)
 
@@ -296,6 +400,7 @@ class BacktestEngine:
             summary=summary,
             trades=self.executor.trade_history,
             equity_curve=equity_records,
+            signals_log=signals_log,
             candle_count=len(df),
             start_date=start_date,
             end_date=end_date,
@@ -303,41 +408,3 @@ class BacktestEngine:
             execution_type=self.config.execution_type.value,
             timeframe=self.config.resolution
         )
-
-    def _apply_market_slippage(self, signal: TradingSignal, close: float) -> float:
-        """
-        Applies directional slippage per signal type.
-        LONG entry / REVERSE_TO_LONG → buy at close + slippage (worse fill going up)
-        SHORT entry / REVERSE_TO_SHORT → buy at close - slippage (worse fill going down)
-        Closes on opposite side: same logic.
-        """
-        s = self.config.slippage_pct
-        tick = self.config.tick_size
-
-        buy_signal_types = {
-            SignalType.BUY_LONG,
-            SignalType.REVERSE_TO_LONG,
-        }
-        sell_signal_types = {
-            SignalType.SELL_SHORT,
-            SignalType.REVERSE_TO_SHORT,
-        }
-        # For exits: LONG is closed via sell (gets lower), SHORT via buy (gets higher)
-        exit_long_types = {SignalType.EXIT_LONG}
-        exit_short_types = {SignalType.EXIT_SHORT}
-
-        if signal.signal_type in buy_signal_types:
-            raw = close * (1.0 + s)
-        elif signal.signal_type in sell_signal_types:
-            raw = close * (1.0 - s)
-        elif signal.signal_type in exit_long_types:
-            raw = close * (1.0 - s)   # Selling long: adverse fill = lower price
-        elif signal.signal_type in exit_short_types:
-            raw = close * (1.0 + s)   # Buying back short: adverse fill = higher price
-        else:
-            # REVERSE: determine direction from signal_type already set before this call
-            # (should not reach here, but safe fallback)
-            raw = close
-
-        # Tick-size rounding
-        return round(raw / tick, 0) * tick

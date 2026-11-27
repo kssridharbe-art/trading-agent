@@ -1,5 +1,5 @@
 """
-Strategy Execution Module (Phase 2 Hardened).
+Strategy Execution Module (Phase 2.1 Audit Corrected).
 Manages position state transitions, order sequencing, and trade lifecycles:
 1. Entry execution on valid signal (Flat -> LONG or Flat -> SHORT).
 2. Opposite SuperTrend exit execution.
@@ -9,6 +9,7 @@ Manages position state transitions, order sequencing, and trade lifecycles:
 5. Tick-size rounding on all execution prices.
 6. Partial-fill support: position opened with actual fill fraction.
 7. Position reconciliation: confirmed_flat flag prevents premature reversal.
+8. Exact fee accounting: tracks maker/taker fee rates on entry and exit independently.
 """
 
 from dataclasses import dataclass, field
@@ -43,6 +44,8 @@ class TradeRecord:
     regime_filter: str = "NONE"
     execution_type: str = "MARKET"
     fill_type: str = "MARKET_TAKER"
+    entry_fee_rate: float = 0.0005
+    exit_fee_rate: float = 0.0005
 
 
 @dataclass
@@ -57,7 +60,9 @@ class ActivePosition:
     liquidation_price: float = 0.0
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
-    confirmed_flat: bool = True       # Phase 2: must be True before opening reverse
+    confirmed_flat: bool = True       # Must be True before opening reverse
+    entry_fee_rate: float = 0.0005    # Fee rate applied on entry
+    entry_fill_type: str = "MARKET_TAKER"
 
 
 class StrategyExecutor:
@@ -98,33 +103,34 @@ class StrategyExecutor:
         current_capital: float,
         fee_rate: Optional[float] = None,
         fill_type: str = "MARKET_TAKER"
-    ) -> Tuple["TradeRecord", float]:
+    ) -> Tuple[TradeRecord, float]:
         """
         Closes existing position and records trade details.
         Returns (TradeRecord, updated_capital).
         Tick-size rounding applied to exit_price.
+        Enforces exact reconciliation: gross_pnl - fees - funding = net_pnl.
         """
         if self.position.side == PositionSide.NONE or self.position.contracts == 0:
             raise ValueError("No active position to close.")
 
         exit_price = self._round_tick(exit_price)
-        fee_rate = fee_rate or self.config.taker_fee_rate
+        exit_fee_rate = fee_rate if fee_rate is not None else self.config.taker_fee_rate
 
         self.trade_counter += 1
         pos = self.position
         btc_size = pos.contracts * self.risk_manager.contract_value
 
-        # Gross PnL
+        # Gross PnL: price displacement * btc_size
         if pos.side == PositionSide.LONG:
             gross_pnl = btc_size * (exit_price - pos.entry_price)
         else:
             gross_pnl = btc_size * (pos.entry_price - exit_price)
 
-        # Fees
+        # Precise fees
         entry_notional = btc_size * pos.entry_price
         exit_notional = btc_size * exit_price
-        entry_fee = entry_notional * self.config.taker_fee_rate  # entry always taker in baseline
-        exit_fee = exit_notional * fee_rate
+        entry_fee = entry_notional * pos.entry_fee_rate
+        exit_fee = exit_notional * exit_fee_rate
 
         # Funding fee (8h intervals)
         duration_hours = max((exit_timestamp - pos.entry_timestamp) / 3600.0, 0.0)
@@ -157,12 +163,12 @@ class StrategyExecutor:
             ema_method_used=self.config.ema_method.value,
             regime_filter=self.config.regime_filter.value,
             execution_type=self.config.execution_type.value,
-            fill_type=fill_type
+            fill_type=fill_type,
+            entry_fee_rate=pos.entry_fee_rate,
+            exit_fee_rate=exit_fee_rate
         )
 
         self.trade_history.append(record)
-        # NOTE: risk_manager.record_trade_result is called by BacktestEngine
-        # immediately after close_current_position to avoid double-counting.
 
         # Mark flat and confirmed
         self.position = ActivePosition(confirmed_flat=True)
@@ -175,7 +181,8 @@ class StrategyExecutor:
         timestamp: int,
         sizing: SizingResult,
         fill_fraction: float = 1.0,     # 0.6-1.0 for partial fills
-        fill_type: str = "MARKET_TAKER"
+        fill_type: str = "MARKET_TAKER",
+        fee_rate: Optional[float] = None
     ):
         """Opens a new position using validated sizing. Tick-size rounding on entry."""
         price = self._round_tick(price)
@@ -183,6 +190,7 @@ class StrategyExecutor:
         actual_btc = actual_contracts * self.risk_manager.contract_value
         actual_notional = actual_contracts * price * self.risk_manager.contract_value
         actual_margin = actual_notional / self.config.leverage
+        applied_fee_rate = fee_rate if fee_rate is not None else self.config.taker_fee_rate
 
         self.position = ActivePosition(
             side=side,
@@ -195,7 +203,9 @@ class StrategyExecutor:
             liquidation_price=sizing.liquidation_price,
             current_price=price,
             unrealized_pnl=0.0,
-            confirmed_flat=False
+            confirmed_flat=False,
+            entry_fee_rate=applied_fee_rate,
+            entry_fill_type=fill_type
         )
 
     def process_signal(
@@ -205,7 +215,7 @@ class StrategyExecutor:
         fill_qty: Optional[int] = None,   # For limit order fills; pct (60-100 or None)
         fill_type: str = "MARKET_TAKER",
         fee_rate: Optional[float] = None
-    ) -> Tuple[Optional["TradeRecord"], Optional[str], float]:
+    ) -> Tuple[Optional[TradeRecord], Optional[str], float]:
         """
         Processes a trading signal:
         - Executes entry, exit, or reversal.
@@ -218,7 +228,7 @@ class StrategyExecutor:
         capital = current_capital
 
         fill_fraction = (fill_qty / 100.0) if fill_qty is not None else 1.0
-        fee_rate = fee_rate or self.config.taker_fee_rate
+        applied_fee_rate = fee_rate if fee_rate is not None else self.config.taker_fee_rate
 
         if signal.action == "HOLD" or signal.signal_type == SignalType.NONE:
             self.update_market_price(signal.price)
@@ -232,7 +242,8 @@ class StrategyExecutor:
             if sizing.allowed:
                 self.open_position(
                     PositionSide.LONG, signal.price, signal.timestamp,
-                    sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                    sizing, fill_fraction=fill_fraction, fill_type=fill_type,
+                    fee_rate=applied_fee_rate
                 )
                 action_msg = (
                     f"OPENED LONG: {self.position.contracts} contracts "
@@ -248,7 +259,8 @@ class StrategyExecutor:
             if sizing.allowed:
                 self.open_position(
                     PositionSide.SHORT, signal.price, signal.timestamp,
-                    sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                    sizing, fill_fraction=fill_fraction, fill_type=fill_type,
+                    fee_rate=applied_fee_rate
                 )
                 action_msg = (
                     f"OPENED SHORT: {self.position.contracts} contracts "
@@ -264,7 +276,7 @@ class StrategyExecutor:
                 exit_timestamp=signal.timestamp,
                 exit_reason="SuperTrend changed to RED; EMA rejected SHORT (Flat in Cash)",
                 current_capital=capital,
-                fee_rate=fee_rate,
+                fee_rate=applied_fee_rate,
                 fill_type=fill_type
             )
             action_msg = (
@@ -278,7 +290,7 @@ class StrategyExecutor:
                 exit_timestamp=signal.timestamp,
                 exit_reason="SuperTrend changed to GREEN; EMA rejected LONG (Flat in Cash)",
                 current_capital=capital,
-                fee_rate=fee_rate,
+                fee_rate=applied_fee_rate,
                 fill_type=fill_type
             )
             action_msg = (
@@ -296,10 +308,10 @@ class StrategyExecutor:
                     exit_timestamp=signal.timestamp,
                     exit_reason="SuperTrend flipped RED & EMA confirmed bearish (Automatic Reversal)",
                     current_capital=capital,
-                    fee_rate=fee_rate,
+                    fee_rate=applied_fee_rate,
                     fill_type=fill_type
                 )
-                # Step 2: Confirm flat (position reset by close_current_position)
+                # Step 2: Confirm flat
                 # Step 3: Size and open SHORT
                 sizing = self.risk_manager.calculate_position_size(
                     capital, signal.price, PositionSide.SHORT, signal.timestamp
@@ -307,7 +319,8 @@ class StrategyExecutor:
                 if sizing.allowed:
                     self.open_position(
                         PositionSide.SHORT, signal.price, signal.timestamp,
-                        sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                        sizing, fill_fraction=fill_fraction, fill_type=fill_type,
+                        fee_rate=applied_fee_rate
                     )
                     action_msg = (
                         f"REVERSED: Closed LONG at {signal.price:.2f} "
@@ -328,7 +341,7 @@ class StrategyExecutor:
                     exit_timestamp=signal.timestamp,
                     exit_reason="SuperTrend flipped GREEN & EMA confirmed bullish (Automatic Reversal)",
                     current_capital=capital,
-                    fee_rate=fee_rate,
+                    fee_rate=applied_fee_rate,
                     fill_type=fill_type
                 )
                 # Step 2: Confirm flat
@@ -339,7 +352,8 @@ class StrategyExecutor:
                 if sizing.allowed:
                     self.open_position(
                         PositionSide.LONG, signal.price, signal.timestamp,
-                        sizing, fill_fraction=fill_fraction, fill_type=fill_type
+                        sizing, fill_fraction=fill_fraction, fill_type=fill_type,
+                        fee_rate=applied_fee_rate
                     )
                     action_msg = (
                         f"REVERSED: Closed SHORT at {signal.price:.2f} "

@@ -1,10 +1,11 @@
 """
-Unit Tests for Phase 2: Strategy Optimization and Risk Hardening.
+Unit Tests for Phase 2 & Phase 2.1: Strategy Optimization, Risk Hardening, and P&L Accounting.
 Covers:
 1. ADX and ATR indicators (batch/stateful parity, warmup, thresholds).
 2. Hardened Risk Management (unrealized floating loss, total drawdown breaker, SQLite persistence).
 3. Regime Filters in Signal Generation (ADX_ONLY, ATR_ONLY, BOTH, unconditional exit).
-4. Execution Simulator (tick rounding, limit order fill/timeout, partial fills).
+4. Execution Simulator (tick rounding, limit entry touch/cancellation, limit exit timeout, maker/taker fee accuracy).
+5. Exact Financial Accounting & Reconciliation (Gross - Fees == Net PnL).
 """
 
 import os
@@ -23,8 +24,9 @@ from delta_trading_agent.indicators.ema import EMAResult
 from delta_trading_agent.signals.signal_generator import SignalGenerator, SignalType, TradingSignal
 from delta_trading_agent.risk.risk_manager import RiskManager
 from delta_trading_agent.storage.database import DatabaseManager
-from delta_trading_agent.execution.strategy_executor import StrategyExecutor
+from delta_trading_agent.execution.strategy_executor import StrategyExecutor, TradeRecord
 from delta_trading_agent.execution.execution_model import ExecutionModel
+from delta_trading_agent.backtest.performance import calculate_performance
 
 
 class TestPhase2Indicators(unittest.TestCase):
@@ -177,7 +179,6 @@ class TestPhase2RegimeFilters(unittest.TestCase):
         sig_gen = SignalGenerator(ema_method=EMAMethod.METHOD_C, regime_filter=RegimeFilterType.ADX_ONLY)
         adx_weak = ADXResult(adx=15.0, plus_di=20.0, minus_di=10.0, dx=33.3, is_trending=False)
 
-        # SuperTrend green reversal + EMA confirmed, BUT ADX < 20 (weak trend)
         sig = sig_gen.evaluate(
             candle_timestamp=1700000300,
             close=51000.0,
@@ -221,7 +222,6 @@ class TestPhase2RegimeFilters(unittest.TestCase):
         self.assertFalse(sig.regime_passed)
 
     def test_unconditional_exit_even_when_regime_fails(self):
-        # When holding LONG and SuperTrend flips RED, exit must ALWAYS execute
         sig_gen = SignalGenerator(ema_method=EMAMethod.METHOD_C, regime_filter=RegimeFilterType.BOTH)
         adx_weak = ADXResult(adx=10.0, plus_di=10.0, minus_di=10.0, dx=0.0, is_trending=False)
         atr_low = ATRResult(atr=30.0, atr_pct=0.06, is_sufficient_vol=False)
@@ -235,7 +235,6 @@ class TestPhase2RegimeFilters(unittest.TestCase):
             adx_res=adx_weak,
             atr_res=atr_low
         )
-        # Position MUST close (to cash since entry filter failed)
         self.assertEqual(sig.action, "CLOSE_LONG")
         self.assertEqual(sig.signal_type, SignalType.EXIT_LONG)
 
@@ -250,7 +249,7 @@ class TestPhase2ExecutionModel(unittest.TestCase):
             taker_fee_rate=0.0005,
             slippage_pct=0.0002
         )
-        self.em = ExecutionModel(self.config)
+        self.em = ExecutionModel(self.config, seed=42)
 
     def test_tick_size_rounding(self):
         self.assertEqual(self.em._round_tick(50000.23), 50000.0)
@@ -258,78 +257,80 @@ class TestPhase2ExecutionModel(unittest.TestCase):
         self.assertEqual(self.em._round_tick(50000.74), 50000.5)
         self.assertEqual(self.em._round_tick(50000.76), 50001.0)
 
-    def test_limit_order_fill_on_touch(self):
-        sig = TradingSignal(
-            timestamp=1700000000,
-            signal_type=SignalType.BUY_LONG,
-            price=50000.0,
-            supertrend_val=49000.0,
-            supertrend_direction="GREEN",
-            ema_val=49500.0,
-            ema_slope=50.0,
-            ema_confirmed=True,
-            ema_method_used=EMAMethod.METHOD_C,
-            position_at_signal=PositionSide.NONE,
-            action="OPEN_LONG",
-            reason="Long signal"
-        )
-        limit_price = self.em.calc_limit_price(sig, 50000.0)
+    def test_limit_entry_fill_on_touch(self):
+        limit_price = self.em.calc_entry_limit_price(is_buy=True, close=50000.0)
         self.assertLess(limit_price, 50000.0)  # Buy limit placed below market
 
-        pending = {
-            "signal": sig,
-            "limit_price": limit_price,
-            "side": SignalType.BUY_LONG,
-            "timeout_bars": 2,
-            "timestamp": 1700000000
-        }
-
-        # Next bar low dips below limit_price -> should fill passively
-        fill = self.em.try_fill_limit(
-            pending_order=pending,
+        # Next bar low dips below limit_price -> should fill passively as maker
+        fill = self.em.check_limit_entry_fill(
+            is_buy=True,
+            limit_price=limit_price,
             bar_high=50100.0,
             bar_low=limit_price - 10.0,
             bar_close=50050.0,
-            bars_waiting=1
+            bars_waiting=0
         )
         self.assertTrue(fill.filled)
-        self.assertFalse(fill.timed_out)
+        self.assertFalse(fill.cancelled)
         self.assertEqual(fill.fill_price, limit_price)
-        self.assertEqual(fill.fee_rate_applied, 0.0002)  # Maker fee
+        self.assertEqual(fill.fee_rate, 0.0002)  # Confirmed Maker fee
 
-    def test_limit_order_timeout(self):
-        sig = TradingSignal(
-            timestamp=1700000000,
-            signal_type=SignalType.BUY_LONG,
-            price=50000.0,
-            supertrend_val=49000.0,
-            supertrend_direction="GREEN",
-            ema_val=49500.0,
-            ema_slope=50.0,
-            ema_confirmed=True,
-            ema_method_used=EMAMethod.METHOD_C,
-            position_at_signal=PositionSide.NONE,
-            action="OPEN_LONG",
-            reason="Long signal"
-        )
-        pending = {
-            "signal": sig,
-            "limit_price": 49990.0,
-            "side": SignalType.BUY_LONG,
-            "timeout_bars": 2,
-            "timestamp": 1700000000
-        }
-        # bars_waiting = 2 (timed out)
-        fill = self.em.try_fill_limit(
-            pending_order=pending,
+    def test_limit_entry_timeout_cancellation(self):
+        # Entry limit order does NOT touch price within timeout -> CANCELLED unfilled
+        fill = self.em.check_limit_entry_fill(
+            is_buy=True,
+            limit_price=49990.0,
             bar_high=50200.0,
             bar_low=50000.0,   # never touched 49990.0
             bar_close=50100.0,
-            bars_waiting=2
+            bars_waiting=2     # reached timeout
+        )
+        self.assertFalse(fill.filled)
+        self.assertTrue(fill.cancelled)
+        self.assertEqual(fill.fill_type, "UNFILLED_CANCELLED")
+
+    def test_limit_exit_timeout_liquidation(self):
+        # Exit limit order does NOT touch price within timeout -> forces liquidation as TAKER
+        fill = self.em.check_limit_exit_fill(
+            is_closing_long=True,
+            limit_price=50100.0,
+            bar_high=50050.0,   # never touched 50100.0
+            bar_low=49800.0,
+            bar_close=49900.0,
+            bars_waiting=2     # reached timeout
         )
         self.assertTrue(fill.filled)
         self.assertTrue(fill.timed_out)
-        self.assertEqual(fill.fee_rate_applied, 0.0005)  # Taker fee on timeout
+        self.assertEqual(fill.fee_rate, 0.0005)  # Taker fee applied on timeout exit
+        self.assertEqual(fill.fill_type, "TIMEOUT_TAKER")
+
+    def test_financial_pnl_accounting_identity(self):
+        # Verifies that Gross PnL - Total Fees == Net PnL down to the penny
+        trades = [
+            TradeRecord(
+                trade_id="TRD-0001",
+                symbol="BTCUSDT",
+                side=PositionSide.LONG,
+                entry_timestamp=1700000000,
+                exit_timestamp=1700003600,
+                entry_price=50000.0,
+                exit_price=52000.0,
+                contracts=1400,
+                btc_size=1.4,
+                margin_used=7000.0,
+                leverage=10.0,
+                gross_pnl=2800.0,         # 1.4 * 2000 = 2800
+                entry_fee=14.0,           # 1.4 * 50000 * 0.0002
+                exit_fee=36.4,            # 1.4 * 52000 * 0.0005
+                funding_fee=0.875,
+                net_pnl=2748.725,         # 2800 - 14 - 36.4 - 0.875
+                return_pct=39.27,
+                exit_reason="Exit",
+                ema_method_used="METHOD_C"
+            )
+        ]
+        summary = calculate_performance(trades, initial_capital=10000.0, equity_curve=[10000.0, 12748.73])
+        self.assertAlmostEqual(summary.total_gross_pnl - summary.total_fees_paid, summary.total_net_pnl, places=2)
 
 
 if __name__ == "__main__":
