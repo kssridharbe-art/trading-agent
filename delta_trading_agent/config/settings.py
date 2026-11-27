@@ -99,3 +99,26 @@ class TradingConfig:
 
 # Default global configuration instance
 CONFIG = TradingConfig()
+
+# Phase 3 Experimental Research Configuration
+BTCUSDT_1H_ADX_ATR_RESEARCH = TradingConfig(
+    symbol="BTCUSDT",
+    resolution="1h",
+    timeframe_seconds=3600,
+    supertrend_length=10,
+    supertrend_factor=3.0,
+    ema_period=9,
+    ema_method=EMAMethod.METHOD_C,
+    regime_filter=RegimeFilterType.BOTH,
+    adx_period=14,
+    adx_threshold=20.0,
+    atr_filter_period=14,
+    atr_min_pct=0.15,
+    execution_type=ExecutionType.MARKET,
+    leverage=10.0,
+    margin_allocation_pct=0.70,
+    unallocated_cash_pct=0.30,
+    initial_capital=10000.0,
+    max_total_drawdown_pct=0.50,
+    live_trading_authorized=False
+)

@@ -237,7 +237,7 @@ class BacktestEngine:
                 continue
 
             # ── 4. Per-Bar Floating Drawdown Check ──────────────────────────────────────
-            self.executor.update_market_price(close)
+            self.executor.update_market_price(close, high=high, low=low)
             unrealized = self.executor.position.unrealized_pnl
             self.risk_manager.update_equity_and_check_drawdown(capital, unrealized, ts)
 

@@ -46,6 +46,11 @@ class TradeRecord:
     fill_type: str = "MARKET_TAKER"
     entry_fee_rate: float = 0.0005
     exit_fee_rate: float = 0.0005
+    max_adverse_excursion_usdt: float = 0.0
+    max_adverse_excursion_pct: float = 0.0
+    liquidation_price: float = 0.0
+    liquidation_distance_pct: float = 0.0
+    notional_exposure: float = 0.0
 
 
 @dataclass
@@ -63,6 +68,7 @@ class ActivePosition:
     confirmed_flat: bool = True       # Must be True before opening reverse
     entry_fee_rate: float = 0.0005    # Fee rate applied on entry
     entry_fill_type: str = "MARKET_TAKER"
+    max_adverse_displacement: float = 0.0
 
 
 class StrategyExecutor:
@@ -81,8 +87,8 @@ class StrategyExecutor:
         tick = self.config.tick_size
         return round(price / tick) * tick
 
-    def update_market_price(self, price: float):
-        """Updates unrealized PnL based on current candle price."""
+    def update_market_price(self, price: float, high: Optional[float] = None, low: Optional[float] = None):
+        """Updates unrealized PnL and adverse excursion based on current candle price."""
         if self.position.side == PositionSide.NONE or self.position.contracts == 0:
             self.position.unrealized_pnl = 0.0
             self.position.current_price = price
@@ -92,8 +98,16 @@ class StrategyExecutor:
         contract_btc = self.position.contracts * self.risk_manager.contract_value
         if self.position.side == PositionSide.LONG:
             self.position.unrealized_pnl = contract_btc * (price - self.position.entry_price)
+            bar_low = low if low is not None else price
+            adverse = max(0.0, self.position.entry_price - bar_low)
+            if adverse > self.position.max_adverse_displacement:
+                self.position.max_adverse_displacement = adverse
         elif self.position.side == PositionSide.SHORT:
             self.position.unrealized_pnl = contract_btc * (self.position.entry_price - price)
+            bar_high = high if high is not None else price
+            adverse = max(0.0, bar_high - self.position.entry_price)
+            if adverse > self.position.max_adverse_displacement:
+                self.position.max_adverse_displacement = adverse
 
     def close_current_position(
         self,
@@ -141,6 +155,11 @@ class StrategyExecutor:
         return_pct = (net_pnl / pos.margin_used * 100.0) if pos.margin_used > 0 else 0.0
         new_capital = current_capital + net_pnl
 
+        mae_usdt = round(pos.max_adverse_displacement * btc_size, 4)
+        mae_pct = round((pos.max_adverse_displacement / pos.entry_price * 100.0) if pos.entry_price > 0 else 0.0, 2)
+        notional_exp = round(entry_notional, 2)
+        liq_dist_pct = round(abs(pos.entry_price - pos.liquidation_price) / pos.entry_price * 100.0, 2) if pos.entry_price > 0 else 0.0
+
         record = TradeRecord(
             trade_id=f"TRD-{self.trade_counter:04d}",
             symbol=self.config.symbol,
@@ -165,7 +184,12 @@ class StrategyExecutor:
             execution_type=self.config.execution_type.value,
             fill_type=fill_type,
             entry_fee_rate=pos.entry_fee_rate,
-            exit_fee_rate=exit_fee_rate
+            exit_fee_rate=exit_fee_rate,
+            max_adverse_excursion_usdt=mae_usdt,
+            max_adverse_excursion_pct=mae_pct,
+            liquidation_price=round(pos.liquidation_price, 2),
+            liquidation_distance_pct=liq_dist_pct,
+            notional_exposure=notional_exp
         )
 
         self.trade_history.append(record)
