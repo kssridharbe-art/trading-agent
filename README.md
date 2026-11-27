@@ -88,55 +88,20 @@ The framework enforces strict mathematical consistency across the entire reporti
 
 ---
 
-### 4. Automated Test Suite (33/33 Passing)
+### 4. Automated Test Suite (42/42 Passing)
 
 Run the full automated test suite:
 ```bash
-python -m pytest delta_trading_agent/tests/ -v
+python -m unittest discover -s delta_trading_agent/tests -p "test_*.py" -v
 ```
 
-```text
-============================= test session starts =============================
-platform win32 -- Python 3.13.14, pytest-9.2.0, pluggy-1.7.0
-rootdir: C:\Users\acer\Downloads\Local_AI_Agent
-collected 33 items
-
-delta_trading_agent/tests/test_indicators.py::TestIndicators::test_ema_batch_and_stateful_parity PASSED [  3%]
-delta_trading_agent/tests/test_indicators.py::TestIndicators::test_stateful_vs_batch_supertrend_parity PASSED [  6%]
-delta_trading_agent/tests/test_indicators.py::TestIndicators::test_supertrend_batch_calculation PASSED [  9%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2Indicators::test_adx_batch_and_stateful_parity PASSED [ 12%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2Indicators::test_atr_batch_and_stateful_parity PASSED [ 15%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RiskManager::test_max_total_drawdown_protection PASSED [ 18%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RiskManager::test_sqlite_persistence_and_restore PASSED [ 21%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RiskManager::test_unrealized_floating_loss_trips_circuit_breaker PASSED [ 24%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RegimeFilters::test_adx_filter_allows_entry_when_above_threshold PASSED [ 27%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RegimeFilters::test_adx_filter_blocks_entry_when_below_threshold PASSED [ 30%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RegimeFilters::test_atr_filter_blocks_entry_when_low_volatility PASSED [ 33%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2RegimeFilters::test_unconditional_exit_even_when_regime_fails PASSED [ 36%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2ExecutionModel::test_financial_pnl_accounting_identity PASSED [ 39%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2ExecutionModel::test_limit_entry_fill_on_touch PASSED [ 42%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2ExecutionModel::test_limit_entry_timeout_cancellation PASSED [ 45%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2ExecutionModel::test_limit_exit_timeout_liquidation PASSED [ 48%]
-delta_trading_agent/tests/test_phase2.py::TestPhase2ExecutionModel::test_tick_size_rounding PASSED [ 51%]
-delta_trading_agent/tests/test_phase3.py::TestPhase3Research::test_liquidation_distance_calculation PASSED [ 54%]
-delta_trading_agent/tests/test_phase3.py::TestPhase3Research::test_margin_allocation_scaling PASSED [ 57%]
-delta_trading_agent/tests/test_phase3.py::TestPhase3Research::test_maximum_adverse_excursion_long PASSED [ 60%]
-delta_trading_agent/tests/test_phase3.py::TestPhase3Research::test_maximum_adverse_excursion_short PASSED [ 63%]
-delta_trading_agent/tests/test_phase3.py::TestPhase3Research::test_research_configuration_preset PASSED [ 66%]
-delta_trading_agent/tests/test_risk_manager.py::TestRiskManager::test_70_percent_margin_allocation_sizing PASSED [ 69%]
-delta_trading_agent/tests/test_risk_manager.py::TestRiskManager::test_consecutive_losses_circuit_breaker PASSED [ 72%]
-delta_trading_agent/tests/test_risk_manager.py::TestRiskManager::test_daily_loss_circuit_breaker PASSED [ 75%]
-delta_trading_agent/tests/test_risk_manager.py::TestRiskManager::test_liquidation_price_estimation PASSED [ 78%]
-delta_trading_agent/tests/test_signals.py::TestSignals::test_duplicate_candle_rejection PASSED [ 81%]
-delta_trading_agent/tests/test_signals.py::TestSignals::test_long_entry_method_a PASSED [ 84%]
-delta_trading_agent/tests/test_signals.py::TestSignals::test_reversal_without_ema_confirmation_exits_to_cash PASSED [ 87%]
-delta_trading_agent/tests/test_signals.py::TestSignals::test_short_entry_and_reversal_rules PASSED [ 90%]
-delta_trading_agent/tests/test_strategy.py::TestStrategyExecution::test_automatic_reversal_long_to_short PASSED [ 93%]
-delta_trading_agent/tests/test_strategy.py::TestStrategyExecution::test_exit_to_cash_when_ema_rejects_reversal PASSED [ 96%]
-delta_trading_agent/tests/test_strategy.py::TestStrategyExecution::test_open_long_execution PASSED [100%]
-
-======================= 33 passed in 2.48s =======================
-```
+All 42 unit and integration tests pass across:
+- Stateful & batch indicator parity (SuperTrend, EMA 9, ADX 14, ATR 14, Choppiness Index 14).
+- 4-Hour HTF Trend aggregation (zero lookahead bias, completed 4h block boundaries).
+- Regime filters (ADX Rising, HTF Trend, Choppiness, ST Separation).
+- Delta Exchange tiered MMR schedule & 0.5% liquidation fee penalty buffer.
+- Active emergency position closure upon daily loss and portfolio drawdown circuit breaker breach.
+- Financial P&L accounting identity ($\text{Gross} - \text{Fees} == \text{Net}$ to the penny).
 
 ---
 
@@ -165,8 +130,42 @@ python run_phase3_validation.py
 
 ---
 
-### 6. Risk Disclosures & Live Trading Safeguards
+### 6. Phase 4: Market Regime Detection & Strategy Robustness Research
+
+```bash
+python run_phase4_research.py
+```
+
+Phase 4 evaluates whether independent market regime filters can restore profitability and control drawdown across 12-Month (8,760 candles) and 24-Month (17,520 candles: Nov 27, 2024 to Nov 27, 2026) historical horizons.
+
+#### Independent Regime Filters Evaluated:
+1. **Baseline (`NONE`)**: Unconstrained SuperTrend (10,3) + EMA 9 Method C.
+2. **Filter A (`BOTH`)**: Baseline ADX > 20 + ATR% > 0.15%.
+3. **Filter B (`ADX_RISING`)**: Requires ADX > 20 and rising over completed candles ($ADX_t > ADX_{t-1}$).
+4. **Filter C (`HTF_TREND`)**: 4-Hour higher-timeframe trend filter (4h EMA 50 > EMA 200 for Long, < EMA 200 for Short). Strictly zero look-ahead bias (aggregates 4h blocks at UTC 03, 07, 11, 15, 19, 23).
+5. **Filter D (`CHOP_FILTER`)**: Choppiness Index (Dreiss formula, $n=14$, threshold 61.8). Blocks entries when market is classified as sideways.
+6. **Filter E (`ST_SEPARATION`)**: SuperTrend separation filter ($|Close - ST| / ATR \ge 0.50$).
+
+#### Risk Hardening & Circuit Breakers:
+- **Root Cause of Daily Losses > 5% in Phase 3**: Passive circuit breakers blocked future entries but left open positions unmanaged, allowing adverse floating drift to expand.
+- **Active Emergency Closure (`close_on_circuit_breaker=True`)**: Immediately liquidates open positions at market upon tripping the 5% daily loss limit or portfolio drawdown limit.
+- **Delta Exchange Liquidation Model**: Tier 1 MMR (0.5%) + 0.5% liquidation fee penalty buffer + intrabar adverse excursion audits. 0 liquidations occurred due to 10% isolated margin sizing.
+
+#### Phase 4 Deliverables:
+- **`phase4_comparison_report.csv`**: 14-configuration performance, risk, and partition metrics.
+- **`phase4_partition_reconciliation.csv`**: 56-row audit verifying exact partition and financial reconciliation.
+- **`phase4_trade_by_trade_audit.csv`**: Complete audit of 1,597 executed trades with MAE, fees, and liquidation distances.
+- **`phase4_monthly_performance.csv`**: 254-month breakdown across all configurations and regimes.
+- **`phase4_regime_robustness.csv`**: 70-row performance matrix across 5 distinct market regimes.
+- **`equity_curves_phase4/`**: 14 full bar-by-bar portfolio equity and drawdown curves.
+
+---
+
+### 7. Risk Disclosures & Scientific Verdict
 
 - **Live Trading Hard Stop**: `live_trading_authorized = False` is strictly hardcoded and enforced.
-- **Capital Allocation Finding**: 70% capital allocation on 10x leverage creates 7.0x effective leverage on account equity, causing catastrophic drawdown during prolonged choppy regimes. Only conservative margin sizing (10% to 20%) allows the account to survive adverse market cycles without triggering total drawdown circuit breakers.
-- **Operational Verdict**: While the strategy generated profitable net returns in Validation and Out-of-Sample periods (H2 2026), its performance in choppy ranging regimes (H1 2026) experienced substantial drawdowns. The strategy is NOT approved for live capital until extensive paper trading in live market conditions confirms regime filter resilience.
+- **Empirical Scientific Finding**:
+  - Over a 12-month horizon, Filter C (HTF Trend) showed positive Out-of-Sample returns (+$1,298.15), but over the full 24-month horizon, it suffered a catastrophic -49.90% net loss and tripped the 50% drawdown safety breaker.
+  - Filter B (ADX Rising) successfully mitigated whipsaws (cutting 12m drawdown from 50.3% to 28.9%), but still generated negative net returns (-19.85% in 12m, -32.80% in 24m).
+  - Across all 14 configurations and both 12-month and 24-month horizons, **no filter produced a positive net expectancy or profitable profit factor (all PF < 1.0)**.
+- **Final Quantitative Verdict**: The strategy is **NOT VIABLE FOR LIVE CAPITAL**. Live trading is **STRICTLY REJECTED AND UNAUTHORIZED**.

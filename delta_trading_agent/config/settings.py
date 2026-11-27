@@ -17,10 +17,14 @@ class EMAMethod(str, Enum):
 
 
 class RegimeFilterType(str, Enum):
-    NONE = "NONE"          # Baseline - No filter
-    ADX_ONLY = "ADX_ONLY"  # ADX trend strength filter
-    ATR_ONLY = "ATR_ONLY"  # ATR volatility threshold filter
-    BOTH = "BOTH"          # Both ADX and ATR required
+    NONE = "NONE"                    # Baseline - No filter
+    ADX_ONLY = "ADX_ONLY"            # ADX trend strength filter
+    ATR_ONLY = "ATR_ONLY"            # ATR volatility threshold filter
+    BOTH = "BOTH"                    # Baseline Candidate: Both ADX and ATR required
+    ADX_RISING = "ADX_RISING"        # Filter B: ADX > threshold AND rising over completed candles
+    HTF_TREND = "HTF_TREND"          # Filter C: 4-Hour EMA 50 / 200 trend alignment
+    CHOP_FILTER = "CHOP_FILTER"      # Filter D: Choppiness Index (< threshold, blocking sideways)
+    ST_SEPARATION = "ST_SEPARATION"  # Filter E: SuperTrend distance separation (|Close - ST| / ATR >= threshold)
 
 
 class ExecutionType(str, Enum):
@@ -60,12 +64,17 @@ class TradingConfig:
     ema_period: int = 9
     ema_method: EMAMethod = EMAMethod.METHOD_C  # Default: Method C (Close + Slope confirmation)
     
-    # Optional Market Regime Filters (Phase 2 Optimization)
+    # Optional Market Regime Filters (Phase 2 & Phase 4)
     regime_filter: RegimeFilterType = RegimeFilterType.NONE  # Default: Baseline NONE
     adx_period: int = 14
     adx_threshold: float = 20.0               # Minimum ADX value for trending regime
     atr_filter_period: int = 14
     atr_min_pct: float = 0.15                 # Minimum (ATR / Close) * 100% volatility threshold
+    chop_period: int = 14
+    chop_threshold: float = 61.8              # Choppiness Index ceiling: block entries if CHOP >= threshold
+    st_separation_min_atr: float = 0.50       # Minimum distance between Close and SuperTrend in ATR units
+    htf_ema_fast: int = 50                    # 4-hour HTF EMA fast period
+    htf_ema_slow: int = 200                   # 4-hour HTF EMA slow period
     
     # Execution Simulation Model (Phase 2 Optimization)
     execution_type: ExecutionType = ExecutionType.MARKET  # Default: Baseline MARKET
@@ -81,6 +90,8 @@ class TradingConfig:
     max_consecutive_losses: int = 3           # Circuit breaker after N consecutive losses
     max_total_drawdown_pct: float = 0.20      # 20% max total equity drawdown protection
     include_unrealized_in_daily_loss: bool = True # Hardened: include floating loss in risk monitoring
+    close_on_circuit_breaker: bool = True     # Immediately close open positions when daily loss or drawdown breaker trips
+    liquidation_fee_rate: float = 0.005       # 0.5% Delta Exchange liquidation fee penalty buffer
     
     # Fees & Execution assumptions (Delta Exchange standard rates)
     maker_fee_rate: float = 0.0002            # 0.02%

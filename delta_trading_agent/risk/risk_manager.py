@@ -224,7 +224,9 @@ class RiskManager:
         liq_price = self.calculate_liquidation_price(
             entry_price=price,
             side=side,
-            leverage=self.config.leverage
+            leverage=self.config.leverage,
+            notional=notional_value,
+            include_liquidation_fee=True
         )
 
         return SizingResult(
@@ -238,28 +240,78 @@ class RiskManager:
             reason="Size validated against 70% margin allocation and risk rules"
         )
 
+    def get_maintenance_margin_rate(self, notional: float = 0.0) -> float:
+        """Delta Exchange BTCUSDT tiered maintenance margin schedule."""
+        if notional <= 100000.0:
+            return 0.005  # Tier 1: 0.5%
+        elif notional <= 500000.0:
+            return 0.010  # Tier 2: 1.0%
+        elif notional <= 1000000.0:
+            return 0.015  # Tier 3: 1.5%
+        else:
+            return 0.020  # Tier 4: 2.0%
+
     def calculate_liquidation_price(
         self,
         entry_price: float,
         side: PositionSide,
-        leverage: float
+        leverage: float,
+        notional: float = 0.0,
+        include_liquidation_fee: bool = False
     ) -> float:
         """
-        Estimates liquidation price based on isolated leverage & maintenance margin.
-        For LONG: Entry * (1 - 1/leverage + MMR)
-        For SHORT: Entry * (1 + 1/leverage - MMR)
+        Exact Delta Exchange isolated liquidation price:
+        Includes tiered maintenance margin requirement and 0.50% liquidation fee penalty.
+        For LONG:  Entry * (1.0 - 1/leverage + MMR + LiquidationFee)
+        For SHORT: Entry * (1.0 + 1/leverage - MMR - LiquidationFee)
         """
         if leverage <= 0:
             return 0.0
 
+        mmr = self.get_maintenance_margin_rate(notional)
+        liq_fee = getattr(self.config, "liquidation_fee_rate", 0.005) if include_liquidation_fee else 0.0
+
         if side == PositionSide.LONG:
-            # Drop that wipes out initial margin minus maintenance buffer
-            liq = entry_price * (1.0 - (1.0 / leverage) + self.maintenance_margin_rate)
+            liq = entry_price * (1.0 - (1.0 / leverage) + mmr + liq_fee)
             return max(liq, 0.0)
         elif side == PositionSide.SHORT:
-            liq = entry_price * (1.0 + (1.0 / leverage) - self.maintenance_margin_rate)
+            liq = entry_price * (1.0 + (1.0 / leverage) - mmr - liq_fee)
             return liq
         return 0.0
+
+    def check_intrabar_liquidation(
+        self,
+        pos: Any,
+        bar_high: float,
+        bar_low: float
+    ) -> Tuple[bool, bool, float]:
+        """
+        Audits intrabar high/low movements against liquidation price:
+        Returns: (is_liquidated, is_near_liquidation, margin_ratio)
+        - is_liquidated: True if adverse price breaches liquidation price.
+        - is_near_liquidation: True if price came within 2% of liquidation price.
+        - margin_ratio: ratio of adverse excursion to liquidation distance (>= 1.0 = liquidated).
+        """
+        if pos.side == PositionSide.NONE or pos.contracts == 0 or pos.liquidation_price <= 0:
+            return False, False, 0.0
+
+        if pos.side == PositionSide.LONG:
+            liq_dist = pos.entry_price - pos.liquidation_price
+            adverse_move = pos.entry_price - bar_low
+            margin_ratio = (adverse_move / liq_dist) if liq_dist > 0 else 0.0
+            is_liquidated = bar_low <= pos.liquidation_price
+            is_near = (bar_low - pos.liquidation_price) / pos.entry_price <= 0.02
+            return is_liquidated, is_near, round(margin_ratio, 4)
+
+        elif pos.side == PositionSide.SHORT:
+            liq_dist = pos.liquidation_price - pos.entry_price
+            adverse_move = bar_high - pos.entry_price
+            margin_ratio = (adverse_move / liq_dist) if liq_dist > 0 else 0.0
+            is_liquidated = bar_high >= pos.liquidation_price
+            is_near = (pos.liquidation_price - bar_high) / pos.entry_price <= 0.02
+            return is_liquidated, is_near, round(margin_ratio, 4)
+
+        return False, False, 0.0
 
     def record_trade_result(self, net_pnl: float, current_capital: float, timestamp: Optional[int] = None):
         """

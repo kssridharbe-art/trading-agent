@@ -23,6 +23,8 @@ from ..indicators.supertrend import calculate_supertrend, StatefulSuperTrend
 from ..indicators.ema import calculate_ema, StatefulEMA
 from ..indicators.adx import StatefulADX
 from ..indicators.atr import StatefulATR
+from ..indicators.choppiness import StatefulChoppiness
+from ..indicators.htf_trend import StatefulHTFTrend
 from ..signals.signal_generator import SignalGenerator, TradingSignal, SignalType
 from ..risk.risk_manager import RiskManager
 from ..execution.strategy_executor import StrategyExecutor, TradeRecord
@@ -43,6 +45,8 @@ class BacktestResult:
     regime_filter: str
     execution_type: str
     timeframe: str
+    liquidation_events: int = 0
+    near_liquidation_events: int = 0
 
 
 _RESOLUTION_SECONDS: Dict[str, int] = {
@@ -79,6 +83,16 @@ class BacktestEngine:
             period=self.config.atr_filter_period,
             min_pct_threshold=self.config.atr_min_pct
         )
+        self.choppiness = StatefulChoppiness(
+            period=self.config.chop_period,
+            threshold=self.config.chop_threshold
+        )
+        self.htf_trend = StatefulHTFTrend(
+            fast_period=self.config.htf_ema_fast,
+            slow_period=self.config.htf_ema_slow
+        )
+        self.liquidation_events: int = 0
+        self.near_liquidation_events: int = 0
 
     @staticmethod
     def fetch_historical_candles_from_delta(
@@ -150,9 +164,38 @@ class BacktestEngine:
 
         for i, row in df.iterrows():
             ts = int(row["timestamp"])
+            open_p = float(row.get("open", row["close"]))
             high = float(row["high"])
             low = float(row["low"])
             close = float(row["close"])
+
+            # ── 0. Check Intrabar Liquidation on Existing Position ──────────────────────
+            if self.executor.position.side != PositionSide.NONE:
+                is_liq, is_near, margin_ratio = self.risk_manager.check_intrabar_liquidation(
+                    self.executor.position, high, low
+                )
+                if is_near:
+                    self.near_liquidation_events += 1
+                if is_liq:
+                    self.liquidation_events += 1
+                    liq_p = self.executor.position.liquidation_price
+                    trade_record, capital = self.executor.close_current_position(
+                        exit_price=liq_p,
+                        exit_timestamp=ts,
+                        exit_reason="Forced Liquidation – MMR Breached",
+                        current_capital=capital,
+                        fee_rate=self.config.liquidation_fee_rate,
+                        fill_type="FORCED_LIQUIDATION"
+                    )
+                    self.risk_manager.record_trade_result(trade_record.net_pnl, capital, ts)
+                    pending_exit = None
+                    pending_entry = None
+                    signals_log.append({
+                        "timestamp": ts,
+                        "action": "FORCED_LIQUIDATION",
+                        "price": liq_p,
+                        "reason": f"Adverse bar excursion (low={low}, high={high}) breached liquidation price at {liq_p:.2f}"
+                    })
 
             # ── 1. Process Pending Limit Exit (Priority: must close existing pos first) ──
             if pending_exit is not None:
@@ -232,14 +275,35 @@ class BacktestEngine:
             ema_res = self.ema.update(close)
             adx_res = self.adx.update(high, low, close)
             atr_res = self.atr.update(high, low, close)
+            chop_res = self.choppiness.update(high, low, close)
+            htf_res = self.htf_trend.update(ts, open_p, high, low, close)
 
             if st_res is None or ema_res is None:
                 continue
 
-            # ── 4. Per-Bar Floating Drawdown Check ──────────────────────────────────────
+            # ── 4. Per-Bar Floating Drawdown Check & Circuit Breakers ───────────────────
             self.executor.update_market_price(close, high=high, low=low)
             unrealized = self.executor.position.unrealized_pnl
-            self.risk_manager.update_equity_and_check_drawdown(capital, unrealized, ts)
+            breaker_tripped = self.risk_manager.update_equity_and_check_drawdown(capital, unrealized, ts)
+
+            if breaker_tripped and self.config.close_on_circuit_breaker and self.executor.position.side != PositionSide.NONE:
+                trade_record, capital = self.executor.close_current_position(
+                    exit_price=close,
+                    exit_timestamp=ts,
+                    exit_reason=f"Emergency Close: {self.risk_manager.circuit_breaker_reason}",
+                    current_capital=capital,
+                    fee_rate=self.config.taker_fee_rate,
+                    fill_type="CIRCUIT_BREAKER_EMERGENCY_CLOSE"
+                )
+                self.risk_manager.record_trade_result(trade_record.net_pnl, capital, ts)
+                pending_exit = None
+                pending_entry = None
+                signals_log.append({
+                    "timestamp": ts,
+                    "action": "EMERGENCY_CLOSE_BREAKER",
+                    "price": close,
+                    "reason": f"Circuit breaker tripped ({self.risk_manager.circuit_breaker_reason}); position closed immediately to cash"
+                })
 
             # ── 5. Evaluate Completed Candle Signal ─────────────────────────────────────
             current_pos_side = self.executor.get_position_state()
@@ -250,7 +314,10 @@ class BacktestEngine:
                 ema_res=ema_res,
                 current_position=current_pos_side,
                 adx_res=adx_res,
-                atr_res=atr_res
+                atr_res=atr_res,
+                chop_res=chop_res,
+                htf_res=htf_res,
+                st_separation_min_atr=self.config.st_separation_min_atr
             )
 
             # ── 6. Process Evaluated Signal ─────────────────────────────────────────────
@@ -369,6 +436,8 @@ class BacktestEngine:
                 "ema": round(ema_res.ema, 2),
                 "adx": round(adx_res.adx, 2) if adx_res else None,
                 "atr_pct": round(atr_res.atr_pct, 4) if atr_res else None,
+                "chop": chop_res.chop if chop_res else None,
+                "htf_trend": htf_res.trend_direction if htf_res else None,
                 "signal_action": signal.action,
                 "regime_passed": signal.regime_passed
             })
@@ -406,5 +475,7 @@ class BacktestEngine:
             end_date=end_date,
             regime_filter=self.config.regime_filter.value,
             execution_type=self.config.execution_type.value,
-            timeframe=self.config.resolution
+            timeframe=self.config.resolution,
+            liquidation_events=self.liquidation_events,
+            near_liquidation_events=self.near_liquidation_events
         )
